@@ -85,7 +85,7 @@ async def _streaming_response(
     return StreamingResponse(body(), media_type="text/event-stream")
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(
     request: ChatCompletionRequest,
     _auth: None = Depends(require_auth),
