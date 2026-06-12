@@ -4,39 +4,79 @@ __pycache__/
 *$py.class
 *.so
 .Python
+
+# ===== 패키징 / 빌드 아티팩트 =====
 build/
 dist/
+sdist/
+wheels/
+*.egg
 *.egg-info/
 .eggs/
+develop-eggs/
+.installed.cfg
+MANIFEST
 
 # ===== 가상환경 =====
 .venv/
 venv/
 env/
 ENV/
+__pypackages__/
 
 # ===== 환경변수 / 시크릿 =====
+# .env 류는 전부 무시하되 템플릿(.env.example)만 추적
 .env
 .env.*
 !.env.example
+.envrc
+# 키/인증서 — 게이트웨이가 API 키를 다루므로 실수 커밋 방지
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.*
+credentials.json
 
-# ===== 테스트 / 린트 캐시 =====
+# ===== 테스트 / 린트 / 타입체크 캐시 =====
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.hypothesis/
 htmlcov/
 .coverage
 .coverage.*
+coverage.xml
+*.cover
+
+# ===== 로그 =====
+*.log
+logs/
+
+# ===== 노트북 =====
+.ipynb_checkpoints/
 
 # ===== IDE / 에디터 =====
 .idea/
 .vscode/
+*.iml
+*.code-workspace
 *.swp
 *~
 
 # ===== OS =====
 .DS_Store
+.AppleDouble
+.Spotlight-V100
+.Trashes
 Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
 
 # ===== Claude Code =====
 # 공용 프로젝트 설정(.claude/settings.json)은 커밋, 개인 로컬 설정은 제외
