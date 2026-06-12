@@ -1,0 +1,43 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ===== 가상환경 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 환경변수 / 시크릿 =====
+.env
+.env.*
+!.env.example
+
+# ===== 테스트 / 린트 캐시 =====
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# ===== IDE / 에디터 =====
+.idea/
+.vscode/
+*.swp
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Claude Code =====
+# 공용 프로젝트 설정(.claude/settings.json)은 커밋, 개인 로컬 설정은 제외
+.claude/settings.local.json

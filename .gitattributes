@@ -1,0 +1,8 @@
+# 줄바꿈 정규화: 저장소에는 항상 LF로 저장 (Windows 작성 → Linux 배포 환경 일관성)
+* text=auto eol=lf
+
+# 바이너리로 취급할 확장자 (줄바꿈 변환 금지)
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
