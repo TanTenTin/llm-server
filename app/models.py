@@ -30,3 +30,5 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Tool]] = None
     # "auto" | "none" | {"type": "function", "function": {"name": "..."}}
     tool_choice: Optional[Union[str, dict]] = None
+    # Ollama qwen3 전용: False로 설정 시 내부 reasoning(thinking) 비활성화
+    think: Optional[bool] = None

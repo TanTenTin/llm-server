@@ -30,6 +30,8 @@ class OllamaProvider(LLMProvider):
             payload["tools"] = [tool.model_dump() for tool in request.tools]
         if request.tool_choice:
             payload["tool_choice"] = request.tool_choice
+        if request.think is not None:
+            payload["think"] = request.think
         return payload
 
     async def chat(self, request: ChatCompletionRequest, spec: ModelSpec) -> dict:
