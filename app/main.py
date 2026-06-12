@@ -1,9 +1,11 @@
+import secrets
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
+from app.config import settings
 from app.models import ChatCompletionRequest
 from app.registry import MODELS, RouteDecision, resolve
 from app.service import (
@@ -13,6 +15,20 @@ from app.service import (
     http_status_for,
     stream_with_fallback,
 )
+
+
+def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
+    """
+    게이트웨이 공유 토큰 검증. `GATEWAY_API_KEY`가 설정된 경우에만 강제한다.
+    미설정(빈 값)이면 통과 — 내부/로컬 사용을 막지 않기 위함이나, 외부 노출 시엔
+    반드시 키를 설정해야 한다(인증 없는 LLM 프록시 = Anthropic 과금/오남용 위험).
+    타이밍 공격 방지를 위해 상수 시간 비교(compare_digest)를 사용한다.
+    """
+    if not settings.gateway_api_key:
+        return
+    expected = f"Bearer {settings.gateway_api_key}"
+    if authorization is None or not secrets.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @asynccontextmanager
@@ -33,7 +49,7 @@ async def health() -> dict:
 
 
 @app.get("/v1/models")
-async def list_models() -> dict:
+async def list_models(_auth: None = Depends(require_auth)) -> dict:
     """지원 모델 목록 반환 (레지스트리에서 자동 생성, OpenAI 호환)"""
     data = [
         {"id": name, "object": "model", "provider": spec.provider}
@@ -72,6 +88,7 @@ async def _streaming_response(
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
+    _auth: None = Depends(require_auth),
 ) -> dict | StreamingResponse:
     """OpenAI 호환 chat completions 엔드포인트"""
     pool: ProviderPool = app.state.pool

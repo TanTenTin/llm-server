@@ -91,11 +91,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `ANTHROPIC_API_KEY` | `""` (빈 값) | Anthropic API 키. `claude-*` 모델 사용 시 필요 |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소. 온프레미스 호스트로 변경 가능 |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소. Docker 배포 시 compose가 `http://ollama:11434`로 주입 |
+| `GATEWAY_API_KEY` | `""` (빈 값) | 게이트웨이 공유 인증 토큰. 설정 시 `/v1/*` 요청에 `Authorization: Bearer <키>` 필요. **외부 노출 시 반드시 설정** |
 
 ## API
 
 OpenAI SDK / 호환 클라이언트에서 `base_url`만 바꾸면 바로 사용 가능하다.
+
+> **인증**: `GATEWAY_API_KEY`가 설정돼 있으면 `/v1/*` 요청에 `Authorization: Bearer <키>` 헤더가 필요하다(미설정 시 개방). `/health`는 인증 없이 접근 가능.
 
 ### Chat Completions
 
@@ -193,6 +196,7 @@ GET /health   →   { "status": "ok" }
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -d '{"model":"ollama/qwen3:14b","messages":[{"role":"user","content":"안녕"}]}'
 ```
 
@@ -203,7 +207,7 @@ from openai import AsyncOpenAI
 
 client = AsyncOpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="not-needed",  # 게이트웨이 자체는 키 검증 안 함
+    api_key="<GATEWAY_API_KEY>",  # GATEWAY_API_KEY 설정 시 필수, 미설정이면 아무 값
 )
 
 response = await client.chat.completions.create(
@@ -249,8 +253,13 @@ llm-server/
 │       ├── base.py       # Provider 추상 클래스 (LLMProvider)
 │       ├── ollama.py     # Ollama provider (OpenAI API 프록시)
 │       └── anthropic.py  # Anthropic provider (포맷 변환 포함)
+├── Dockerfile            # llm-server 컨테이너 이미지 (python:3.12-slim)
+├── docker-compose.yml    # llm-server + ollama (Oracle 단일 호스트)
+├── .dockerignore
 ├── requirements.txt
 ├── .gitignore
+├── .github/workflows/
+│   └── deploy.yml        # CI/CD: push main → Oracle SSH 배포
 └── .claude/              # Claude Code 프로젝트 설정 + 가이드
 ```
 
@@ -260,26 +269,64 @@ llm-server/
 2. `app/service.py` 의 `ProviderPool` 에 인스턴스 등록
 3. `app/registry.py` 의 `MODELS`/`_passthrough_spec` 에 라우팅 추가 (`/v1/models` 목록은 `MODELS`에서 자동 반영)
 
-## Oracle 서버 배포
+## 배포 (Oracle + Docker Compose + CI/CD)
 
-Oracle Always Free ARM (4 OCPU, 24GB RAM) 기준.
+Oracle Always Free ARM (4 OCPU, 24GB RAM)에서 **Docker Compose**로 `llm-server` + `ollama`를
+함께 띄우고, `main` 브랜치 push 시 **GitHub Actions**가 SSH로 자동 배포한다.
+외부 도메인(`llm.tan-kim.com`) 노출은 **Lightsail의 Caddy 게이트웨이**(별도 `caddy-config` 레포)가
+공인 IP로 cross-host 프록시한다.
+
+```
+        DNS: llm.tan-kim.com → Lightsail
+                 │
+                 ▼
+   Lightsail Caddy (TLS 종료)
+        reverse_proxy <ORACLE_IP>:8000
+                 │  HTTP (Oracle 방화벽에서 Lightsail IP만 허용)
+                 ▼
+   Oracle ─ docker compose
+        llm-server :8000 ──(llm-internal)──▶ ollama :11434
+```
+
+### 1. 최초 1회 — 서버 준비
 
 ```bash
-# 서비스로 등록 (systemd)
-sudo tee /etc/systemd/system/llm-server.service > /dev/null <<EOF
-[Unit]
-Description=LLM Gateway Server
-After=network.target
+# Docker / compose 플러그인 설치는 사전 완료 가정
+git clone https://github.com/<사용자명>/llm-server.git ~/llm-server
+cd ~/llm-server
 
-[Service]
-WorkingDirectory=/home/ubuntu/llm-server
-ExecStart=/home/ubuntu/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
+# .env 작성 (git 제외 대상)
+cat > .env <<'EOF'
+ANTHROPIC_API_KEY=sk-ant-...
+GATEWAY_API_KEY=<충분히-긴-랜덤-토큰>
 EOF
 
-sudo systemctl enable llm-server
-sudo systemctl start llm-server
+docker compose up -d --build
+
+# 레지스트리가 참조하는 Ollama 모델 pull (ollama_data 볼륨에 영속)
+docker compose exec ollama ollama pull qwen3:14b
+docker compose exec ollama ollama pull qwen3.6:27b
 ```
+
+### 2. CI/CD (GitHub Actions)
+
+`main`에 `app/**` · `Dockerfile` · `docker-compose.yml` · `requirements.txt` 변경을 push하면
+`.github/workflows/deploy.yml`이 rsync(`.env` 제외) → `docker compose up -d --build` 한다.
+
+필요한 GitHub Secrets:
+
+| Secret | 값 |
+|--------|----|
+| `ORACLE_HOST` | Oracle 인스턴스 공인 IP |
+| `ORACLE_USER` | SSH 유저 (Ubuntu 이미지 `ubuntu`, Oracle Linux `opc`) |
+| `ORACLE_SSH_KEY` | SSH 개인키 전체 내용 |
+
+### 3. 네트워크 / 방화벽
+
+- **Oracle 보안 목록(VCN Ingress)**: TCP `8000`을 **Lightsail 공인 IP(`54.180.128.251/32`)에서만** 허용.
+- **인스턴스 방화벽**: Oracle 이미지는 기본 iptables/firewalld가 막혀 있으므로 같은 소스로 `8000` 개방 필요.
+  ```bash
+  sudo iptables -I INPUT -p tcp -s 54.180.128.251 --dport 8000 -j ACCEPT
+  ```
+- **DNS**: `llm.tan-kim.com` A → `54.180.128.251`(Lightsail), **DNS only(회색 구름)** — Caddy의 Let's Encrypt 발급용.
+- **인증**: `GATEWAY_API_KEY`를 설정하면 `/v1/*` 호출에 `Authorization: Bearer <키>`가 필요하다. 공인 노출 시 필수.

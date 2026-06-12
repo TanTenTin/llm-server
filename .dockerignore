@@ -1,0 +1,22 @@
+# 빌드 컨텍스트에서 제외 (이미지 경량화 + 시크릿 유입 방지)
+.git
+.gitignore
+.gitattributes
+.github
+.claude
+.venv
+venv
+env
+ENV
+__pycache__
+*.pyc
+*.pyo
+# 시크릿: 빌드에 포함하지 않음 (런타임에 env_file로 주입)
+.env
+.env.*
+!.env.example
+# 캐시 / 문서
+.pytest_cache
+.ruff_cache
+.mypy_cache
+*.md
