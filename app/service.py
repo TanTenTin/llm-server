@@ -7,6 +7,7 @@ from app.config import settings
 from app.models import ChatCompletionRequest
 from app.providers.anthropic import AnthropicProvider
 from app.providers.base import LLMProvider
+from app.providers.gemini import GeminiProvider
 from app.providers.ollama import OllamaProvider
 from app.registry import RouteDecision
 
@@ -35,6 +36,8 @@ class ProviderPool:
         # claude 요청이 와도 '사용 불가 → fallback' 으로 로컬에 떨어지게 한다.
         if settings.anthropic_api_key:
             self._providers["anthropic"] = AnthropicProvider(settings.anthropic_api_key)
+        if settings.google_ai_api_key:
+            self._providers["gemini"] = GeminiProvider(settings.google_ai_api_key)
 
     def get(self, provider_type: str) -> LLMProvider:
         provider = self._providers.get(provider_type)

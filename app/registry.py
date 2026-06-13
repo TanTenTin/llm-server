@@ -26,11 +26,23 @@ class RouteDecision:
 # 레지스트리 (코드 내 관리 — 모델 추가/수정 시 여기만 손대면 됨)
 # ─────────────────────────────────────────────────────────────
 MODELS: dict[str, ModelSpec] = {
+    # ── Gemini (기본 provider) ───────────────────────────────────
+    "gemini-2.5-flash": ModelSpec(
+        provider="gemini",
+        upstream="gemini-2.5-flash",
+        fallback=["ollama/qwen3:14b"],      # 키 미설정 또는 장애 시 로컬로 폴백
+    ),
+    "gemini-2.5-flash-lite": ModelSpec(
+        provider="gemini",
+        upstream="gemini-2.5-flash-lite",
+        fallback=["ollama/qwen3:14b"],
+    ),
+    # ── Anthropic ───────────────────────────────────────────────
     "claude-sonnet-4-6": ModelSpec(
         provider="anthropic",
         upstream="claude-sonnet-4-6",
         max_tokens=8192,
-        fallback=["ollama/qwen3.6:27b"],   # Anthropic 장애 시 로컬로 폴백
+        fallback=["ollama/qwen3.6:27b"],
     ),
     "claude-opus-4-7": ModelSpec(
         provider="anthropic",
@@ -38,18 +50,19 @@ MODELS: dict[str, ModelSpec] = {
         max_tokens=8192,
         fallback=["ollama/qwen3.6:27b"],
     ),
+    # ── Ollama (로컬) ────────────────────────────────────────────
     "ollama/qwen3:14b": ModelSpec(provider="ollama", upstream="qwen3:14b"),
     "ollama/qwen3.6:27b": ModelSpec(provider="ollama", upstream="qwen3.6:27b"),
 }
 
 # 논리적 별칭 → 실제 모델 키. 필요 없으면 비워둬도 됨.
 ALIASES: dict[str, str] = {
-    "fast": "ollama/qwen3:14b",
-    "smart": "claude-sonnet-4-6",
+    "fast": "gemini-2.5-flash-lite",
+    "smart": "gemini-2.5-flash",
 }
 
-# 경로 없는/모르는 요청이 떨어지는 기본 모델 (로컬 Ollama)
-DEFAULT_MODEL = "ollama/qwen3:14b"
+# 기본 모델: GOOGLE_AI_API_KEY 있으면 Gemini, 키 미설정이면 fallback으로 로컬 Ollama
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 # DEFAULT_MODEL은 반드시 MODELS에 존재해야 함 (기동 시점에 즉시 검증)
 if DEFAULT_MODEL not in MODELS:
@@ -70,8 +83,12 @@ def _passthrough_spec(model: str) -> ModelSpec | None:
         return ModelSpec(provider="ollama", upstream=model.removeprefix("ollama/"))
     if model.startswith("anthropic/"):
         return ModelSpec(provider="anthropic", upstream=model.removeprefix("anthropic/"))
+    if model.startswith("gemini/"):
+        return ModelSpec(provider="gemini", upstream=model.removeprefix("gemini/"))
     if model.startswith("claude-"):
         return ModelSpec(provider="anthropic", upstream=model)
+    if model.startswith("gemini-"):
+        return ModelSpec(provider="gemini", upstream=model)
     if ":" in model:
         return ModelSpec(provider="ollama", upstream=model)
     return None
