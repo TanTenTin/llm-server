@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.models import ChatCompletionRequest
-from app.registry import MODELS, RouteDecision, resolve
+from app.registry import AUTO_ROUTE, MODELS, RouteDecision, route
 from app.service import (
     ProviderPool,
     RouteTrace,
@@ -52,7 +52,11 @@ async def health() -> dict:
 @app.get("/v1/models")
 async def list_models(_auth: None = Depends(require_auth)) -> dict:
     """지원 모델 목록 반환 (레지스트리에서 자동 생성, OpenAI 호환)"""
-    data = [
+    # auto는 실제 모델이 아니라 '요청 특성으로 게이트웨이가 고르는' 논리 라우트.
+    data: list[dict] = [
+        {"id": AUTO_ROUTE, "object": "model", "provider": "(auto)"}
+    ]
+    data += [
         {"id": name, "object": "model", "provider": spec.provider}
         for name, spec in MODELS.items()
     ]
@@ -103,7 +107,7 @@ async def chat_completions(
 ) -> dict | StreamingResponse:
     """OpenAI 호환 chat completions 엔드포인트"""
     pool: ProviderPool = app.state.pool
-    decision = resolve(request.model)
+    decision = route(request)  # auto면 요청 특성 기반 선택, 그 외엔 이름 기반
     # 실제로 어떤 모델이 응답했는지 관측용 트레이스. 응답 본문은 OpenAI 형식 그대로 두고
     # (호출 측 SDK 호환 유지), 라우팅 결과는 x-llm-route 헤더로만 노출한다.
     trace = RouteTrace(requested=request.model)

@@ -52,14 +52,22 @@ POST /v1/chat/completions
 
 ## 라우팅 규칙 (registry.py)
 
-`resolve(model)`이 모델명을 RouteDecision으로 변환한다. 위에서부터 먼저 매칭:
+진입점은 `route(request)`. `model="auto"`면 `_auto_route(request)`(요청 특성 기반), 그 외엔 `resolve(model)`이 모델명을 RouteDecision으로 변환한다. resolve는 위에서부터 먼저 매칭:
 
 | 단계 | 처리 |
 |------|------|
-| 1. 별칭 | `ALIASES`에 있으면 실제 모델 키로 치환 (`fast`, `smart` 등) |
+| 1. 별칭 | `ALIASES`에 있으면 실제 모델 키로 치환 (`fast`→gemini-flash-lite, `smart`→gemini-flash) |
 | 2. 레지스트리 | `MODELS`에 등록돼 있으면 그 `ModelSpec`(+fallback 체인) 사용 |
-| 3. 패스스루 | 미등록이라도 형태로 추론: `ollama/` → Ollama, `anthropic/`·`claude-` → Anthropic, 그 외 `:` 포함 → Ollama |
-| 4. 기본값 | 위 어디에도 안 걸리면 `DEFAULT_MODEL`(로컬 Ollama) |
+| 3. 패스스루 | 미등록이라도 형태로 추론: `gemini-`/`gemini/` → Gemini, `ollama/` → Ollama, `anthropic/`·`claude-` → Anthropic, 그 외 `:` 포함 → Ollama |
+| 4. 기본값 | 위 어디에도 안 걸리면 `DEFAULT_MODEL`(gemini-2.5-flash, 키 없으면 로컬 폴백) |
+
+### auto 라우트 (Phase 2 — `_auto_route`)
+
+`model="auto"`면 요청 특성으로 게이트웨이가 직접 모델 선택:
+- **후보**: `AUTO_CANDIDATES`(무료만: gemini-2.5-flash → ollama/qwen3:14b), 비용·품질 우선순위 순. **과금(Claude) 미포함** — 비용 0 보장, Claude는 명시적 지정 필요.
+- **필터**: `tools` 있는데 `supports_tools=False`면 제외, `_estimate_tokens()`(문자수÷`_CHARS_PER_TOKEN=3`) > `context_window`면 제외. 모두 탈락 시 DEFAULT_MODEL로 폴백.
+- 살아남은 후보가 그대로 체인이 되어 Phase 1 회로차단기·`x-llm-route`가 동일 적용.
+- capability 메타는 `ModelSpec.supports_tools`·`context_window`(MODELS에서 모델별 지정).
 
 > 패스스루는 **명시적 prefix 단서(`ollama/`/`anthropic/`/`claude-`)를 콜론보다 먼저** 평가한다. 따라서 미등록 `claude-x:snapshot` 도 Anthropic으로 가고, `qwen3:14b` 처럼 prefix 없이 콜론만 있는 건 Ollama로 간다.
 > 모델명은 `resolve()`에서 `strip()` 으로 앞뒤 공백을 제거한다.

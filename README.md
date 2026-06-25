@@ -221,14 +221,24 @@ response = await client.chat.completions.create(
 
 ## 라우팅 · 별칭 · Fallback
 
-`app/registry.py`의 `resolve()`가 모델 이름을 후보 체인으로 변환한다. **별칭 → 레지스트리 → 패스스루 → 기본값** 순.
+`app/registry.py`의 진입점은 `route(request)`다. `model="auto"`면 요청 특성 기반 선택,
+그 외엔 이름 기반 `resolve()`(**별칭 → 레지스트리 → 패스스루 → 기본값** 순)로 후보 체인을 만든다.
 
 | 단계 | 처리 |
 |------|------|
-| 별칭(`ALIASES`) | `fast` → `ollama/qwen3:14b`, `smart` → `claude-sonnet-4-6` 등으로 치환 |
+| 별칭(`ALIASES`) | `fast` → `gemini-2.5-flash-lite`, `smart` → `gemini-2.5-flash` 등으로 치환 |
 | 레지스트리(`MODELS`) | 등록된 모델이면 그 spec(+fallback) 사용 |
-| 패스스루 | 미등록이라도 `ollama/`·`anthropic/`·`claude-` prefix, 그 외 `:` 포함으로 provider 추론 |
-| 기본값(`DEFAULT_MODEL`) | 위에 안 걸리는/모르는 모델은 로컬 Ollama로 |
+| 패스스루 | 미등록이라도 `gemini-`·`ollama/`·`anthropic/`·`claude-` prefix, 그 외 `:` 포함으로 provider 추론 |
+| 기본값(`DEFAULT_MODEL`) | 위에 안 걸리는/모르는 모델은 `gemini-2.5-flash`(키 없으면 로컬 Ollama로 폴백) |
+
+### auto 라우트 (요청 특성 기반 자동 선택)
+
+`model="auto"`로 보내면 게이트웨이가 **요청 특성을 보고 직접 모델을 고른다**. 클라이언트는 어떤 모델이 있는지 몰라도 된다.
+
+- **후보**: 무료만(`AUTO_CANDIDATES` = `gemini-2.5-flash` → `ollama/qwen3:14b`), 비용·품질 우선순위 순. **과금(Claude)은 auto가 자동 선택하지 않는다**(비용 0 보장 — Claude가 필요하면 모델명을 명시).
+- **필터**: 도구(`tools`)를 쓰는 요청인데 도구 미지원 모델은 제외, 추정 입력 토큰이 `context_window`를 초과하는 모델은 제외. (예: 입력이 ~66k 토큰이면 32k 로컬은 빠지고 1M Gemini만 남는다.)
+- **토큰 추정**: 메시지+도구 정의의 문자 수 ÷ 3 (정확한 토큰화가 아니라 "로컬에 들어가나, 큰 컨텍스트가 필요한가" 판단용 근사치).
+- 살아남은 후보가 그대로 폴백 체인이 되므로, 위의 **회로차단기·`x-llm-route` 헤더가 동일하게 적용**된다.
 
 - **명시적 prefix가 콜론보다 우선**한다 → 미등록 `claude-x:snapshot`도 Anthropic으로, prefix 없는 `qwen3:14b`는 Ollama로 라우팅된다.
 - **Fallback**: 레지스트리 모델에 `fallback`을 지정하면(예: `claude-sonnet-4-6` → `ollama/qwen3.6:27b`) provider 장애·과부하(연결/타임아웃/5xx/529/모델없음)나 키 미설정 시 다음 후보로 자동 전환된다. 스트리밍은 첫 토큰 전까지만 fallback 가능.
