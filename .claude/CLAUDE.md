@@ -14,17 +14,20 @@
 - **Python** + **FastAPI** (ASGI 서버: uvicorn)
 - **httpx** — Ollama·Gemini 비동기 HTTP 프록시 (Gemini는 OpenAI 호환 엔드포인트 사용)
 - **anthropic SDK** — Anthropic API 호출 (`AsyncAnthropic`)
+- **websockets** — Gemini Live(네이티브 WSS) 업스트림 클라이언트 (`/v1/realtime` 음성 브리지)
 - **pydantic-settings** — 환경변수 관리
 
 ## 핵심 구조
 
 ```
 app/
-├── main.py        — 엔드포인트 + lifespan(풀 생성/정리): POST /v1/chat/completions, GET /v1/models, GET /health
-├── config.py      — Settings (GOOGLE_AI_API_KEY, ANTHROPIC_API_KEY, OLLAMA_BASE_URL, GATEWAY_API_KEY, BREAKER_COOLDOWN_SECONDS)
+├── main.py        — 엔드포인트 + lifespan(풀 생성/정리): POST /v1/chat/completions, GET /v1/models, GET /health, WS /v1/realtime
+├── config.py      — Settings (GOOGLE_AI_API_KEY, ANTHROPIC_API_KEY, OLLAMA_BASE_URL, GATEWAY_API_KEY, BREAKER_COOLDOWN_SECONDS, REALTIME_*)
 ├── models.py      — ChatCompletionRequest 등 OpenAI 호환 Pydantic 모델
-├── registry.py    — 라우팅 결정: ModelSpec(+cost_tier/is_free 메타) / RouteDecision / MODELS / ALIASES / DEFAULT_MODEL / resolve()
+├── registry.py    — 라우팅 결정: ModelSpec(+cost_tier/is_free 메타) / RouteDecision / MODELS / ALIASES / DEFAULT_MODEL / resolve() / LIVE_ALIASES·resolve_live_model()
 ├── service.py     — ProviderPool(인스턴스 재사용) + CircuitBreaker + RouteTrace + fallback 실행 + 에러 분류
+├── realtime.py    — /v1/realtime 음성 브리지: OpenAI Realtime 이벤트 ↔ Gemini Live(네이티브 WSS) 양방향 중계 (RealtimeBridge)
+├── audio.py       — PCM16 리샘플러(resample_pcm16): 클라 입력 24kHz → Gemini 16kHz (순수 파이썬, 의존성 0)
 └── providers/
     ├── base.py       — LLMProvider ABC: chat(request, spec) / stream(request, spec) / aclose()
     ├── openai_payload.py — OpenAI 패스스루 payload 공용 빌더(build_openai_payload). Gemini·Ollama 공용
@@ -94,6 +97,25 @@ POST /v1/chat/completions
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소 |
 | `GATEWAY_API_KEY` | `""` | 게이트웨이 공유 인증 토큰. 설정 시 `/v1/*`에 `Authorization: Bearer <키>` 필요 |
 | `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). 일시 장애 provider를 이 시간 동안 폴백 체인 뒤로 미룸. `0` 이하면 비활성화 |
+| `REALTIME_DEFAULT_MODEL` | `gemini-2.5-flash-native-audio-preview-09-2025` | `/v1/realtime` 기본 Gemini Live 모델 id(클라가 `?model=` 미지정 시). **계정의 정확한 id로 교체 필요** |
+| `REALTIME_INPUT_SAMPLE_RATE` | `24000` | 클라 입력 PCM16 레이트(Hz). Gemini Live는 16000 요구 → 다르면 16kHz로 리샘플(같으면 건너뜀) |
+
+## Realtime 음성 브리지 (realtime.py)
+
+`WS /v1/realtime` — **OpenAI Realtime API 호환** 엔드포인트를 **Gemini Live(네이티브 WSS)** 로 중계한다. 무료 티어 Gemini Live를 OpenAI Realtime 클라이언트로 그대로 쓰게 하는 것이 목적. 텍스트 경로(ProviderPool/fallback/회로차단기)와 **완전히 독립** — Live는 로컬 대체가 없어 폴백 개념이 없다.
+
+```
+Client(OpenAI Realtime JSON, pcm16 24kHz)  ⇄  RealtimeBridge  ⇄  Gemini Live(WSS, pcm16 16kHz in / 24kHz out)
+   두 펌프 코루틴(_client_to_gemini / _gemini_to_client)을 asyncio.wait(FIRST_COMPLETED)로 동시 구동,
+   한쪽 종료 시 나머지 취소 + 양쪽 연결 정리
+```
+
+- **연결/인증**: 업스트림 URL은 `wss://.../BidiGenerateContent?key=<GOOGLE_AI_API_KEY>`. 클라이언트 측 게이트웨이 인증은 `ws_authorized()`(main.py)가 `Authorization: Bearer` 헤더 **또는** `?api_key=` 쿼리로 검증(브라우저 WS는 헤더 불가 → 쿼리 허용). `GATEWAY_API_KEY` 미설정 시 개방.
+- **setup은 lazy 1회**: 첫 입력 이벤트 시점에 `BidiGenerateContentSetup`을 보낸다(그 전에 온 `session.update`의 instructions/voice/model 반영). `generationConfig.responseModalities=["AUDIO"]` + `input/outputAudioTranscription` 활성.
+- **모델 해석**: `registry.resolve_live_model(requested, default)` — `LIVE_ALIASES`(`gemini-live` 등) 치환 후 `models/` 접두사 보장. `?model=` 쿼리 또는 `REALTIME_DEFAULT_MODEL`.
+- **오디오**: 입력 24kHz → `audio.resample_pcm16`으로 16kHz 변환 후 `realtimeInput.audio`. 출력 24kHz는 `response.audio.delta`로 패스스루. 리샘플은 순수 파이썬 선형보간(의존성 0).
+- **이벤트 매핑**: README의 "Realtime (음성) API" 표 참고. 응답 턴 경계는 `_begin_response_if_needed`(modelTurn 첫 청크 → `response.created`)·`_finish_response`(`turnComplete`/`interrupted` → `response.done`)로 관리.
+- **한계(v1)**: `toolCall`(함수 호출)·이미지/비디오 입력 미지원(오디오·텍스트만). `session.update`의 model 변경은 setup 전송 전에만 유효. `REALTIME_DEFAULT_MODEL` 기본값은 **추정 id라 실제 계정의 Live 모델 id로 교체** 필요.
 
 ## Anthropic 포맷 변환 주의사항 (providers/anthropic.py)
 

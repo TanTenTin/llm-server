@@ -96,6 +96,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소. Docker 배포 시 compose가 `http://ollama:11434`로 주입 |
 | `GATEWAY_API_KEY` | `""` (빈 값) | 게이트웨이 공유 인증 토큰. 설정 시 `/v1/*` 요청에 `Authorization: Bearer <키>` 필요. **외부 노출 시 반드시 설정** |
 | `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). provider가 일시 장애(429/5xx/연결오류)를 내면 이 시간 동안 폴백 체인 뒤로 미뤄 헛때리는 지연을 제거하고, 만료 시 자동 복귀. `0` 이하면 비활성화 |
+| `REALTIME_DEFAULT_MODEL` | `gemini-2.5-flash-native-audio-preview-09-2025` | `/v1/realtime`에서 클라이언트가 모델을 지정하지 않을 때 쓸 Gemini Live 모델 id. **계정에서 사용 가능한 정확한 id로 교체할 것** |
+| `REALTIME_INPUT_SAMPLE_RATE` | `24000` | 클라이언트가 보내는 입력 PCM16 샘플레이트(Hz). OpenAI Realtime 기본 24000. Gemini Live 입력은 16000을 요구하므로 다르면 브리지가 16kHz로 리샘플(같으면 건너뜀) |
 
 ## API
 
@@ -188,6 +190,33 @@ GET /v1/models
 
 > `app/registry.py`의 `MODELS` 레지스트리에서 자동 생성된다(실제 Ollama 설치 모델을 조회하지는 않음). 모델 추가는 `MODELS`만 수정하면 이 목록에도 반영된다.
 
+### Realtime (음성) API
+
+```
+WS /v1/realtime
+```
+
+**OpenAI Realtime API 호환** WebSocket 엔드포인트. 클라이언트는 OpenAI Realtime 이벤트(JSON)를 그대로 주고받고, 게이트웨이가 내부에서 **Gemini Live API**로 양방향 중계한다(음성 입력 → 음성 출력). 무료 티어 Gemini Live를 OpenAI Realtime SDK/클라이언트로 그대로 쓸 수 있다.
+
+- **모델 지정**: `?model=` 쿼리(미지정 시 `REALTIME_DEFAULT_MODEL`). 친화적 별칭 `gemini-live`도 사용 가능(`app/registry.py`의 `LIVE_ALIASES`).
+- **인증**: `GATEWAY_API_KEY` 설정 시 `Authorization: Bearer <키>` 헤더 **또는** `?api_key=<키>` 쿼리(브라우저 WS는 헤더를 못 붙이므로 쿼리 허용).
+- **오디오 포맷**: 입력 PCM16 24kHz(OpenAI 기본) → 내부에서 16kHz로 리샘플해 Gemini로 전달. 출력은 PCM16 24kHz 패스스루.
+
+**이벤트 매핑** (OpenAI ↔ Gemini Live)
+
+| 방향 | OpenAI 이벤트 | Gemini Live |
+|------|--------------|-------------|
+| → | `session.update` | setup 설정(instructions/voice/model) 반영 |
+| → | `input_audio_buffer.append` | `realtimeInput.audio` (24k→16k 리샘플) |
+| → | `conversation.item.create`(input_text) | `realtimeInput.text` |
+| → | `input_audio_buffer.commit` / `response.create` | no-op (Gemini 자동 VAD가 턴 감지) |
+| ← | `response.audio.delta` | `serverContent.modelTurn.inlineData` (24k 패스스루) |
+| ← | `response.audio_transcript.delta` | `serverContent.outputTranscription` |
+| ← | `conversation.item.input_audio_transcription.delta` | `serverContent.inputTranscription` |
+| ← | `response.done` / `input_audio_buffer.speech_started` | `turnComplete` / `interrupted`(barge-in) |
+
+> **한계(v1)**: 함수 호출(`toolCall`)·이미지/비디오 입력은 미지원(오디오·텍스트만). `session.update`의 model 변경은 첫 입력 전(=setup 전송 전)에만 반영된다(Gemini setup은 1회성). Live는 로컬 대체가 없어 **fallback 하지 않는다**(텍스트 경로의 ProviderPool/회로차단기와 독립).
+
 ### 헬스 체크
 
 ```
@@ -276,12 +305,16 @@ llm-server/
 │   ├── main.py           # FastAPI 앱, 엔드포인트 정의
 │   ├── config.py         # 환경변수 설정 (Settings)
 │   ├── models.py         # Pydantic 모델 (OpenAI 호환 요청)
-│   ├── registry.py       # 라우팅 결정 (ModelSpec/MODELS/ALIASES/resolve)
+│   ├── registry.py       # 라우팅 결정 (ModelSpec/MODELS/ALIASES/resolve, LIVE_ALIASES)
 │   ├── service.py        # ProviderPool(재사용) + fallback 실행
+│   ├── realtime.py       # /v1/realtime — OpenAI Realtime ↔ Gemini Live 음성 브리지
+│   ├── audio.py          # PCM16 리샘플러 (24k→16k, 순수 파이썬)
 │   └── providers/
-│       ├── base.py       # Provider 추상 클래스 (LLMProvider)
-│       ├── ollama.py     # Ollama provider (OpenAI API 프록시)
-│       └── anthropic.py  # Anthropic provider (포맷 변환 포함)
+│       ├── base.py            # Provider 추상 클래스 (LLMProvider)
+│       ├── openai_payload.py  # OpenAI 패스스루 payload 공용 빌더
+│       ├── ollama.py          # Ollama provider (OpenAI API 프록시)
+│       ├── gemini.py          # Gemini provider (OpenAI 호환 엔드포인트 프록시)
+│       └── anthropic.py       # Anthropic provider (포맷 변환 포함)
 ├── Dockerfile            # llm-server 컨테이너 이미지 (python:3.12-slim)
 ├── docker-compose.yml    # llm-server + ollama (Oracle 단일 호스트)
 ├── .dockerignore

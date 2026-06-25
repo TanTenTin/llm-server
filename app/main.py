@@ -2,11 +2,12 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.models import ChatCompletionRequest
+from app.realtime import RealtimeBridge
 from app.registry import AUTO_ROUTE, MODELS, RouteDecision, route
 from app.service import (
     ProviderPool,
@@ -31,6 +32,25 @@ def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
     expected = f"Bearer {settings.gateway_api_key}"
     if authorization is None or not secrets.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def ws_authorized(websocket: WebSocket) -> bool:
+    """
+    WebSocket(/v1/realtime) 공유 토큰 검증. `GATEWAY_API_KEY` 미설정이면 통과.
+    브라우저 WS는 커스텀 헤더를 못 붙이므로, `Authorization: Bearer` 헤더 또는
+    `?api_key=` 쿼리 파라미터 둘 다 허용한다. 상수 시간 비교 사용.
+    """
+    if not settings.gateway_api_key:
+        return True
+    authorization = websocket.headers.get("authorization")
+    if authorization and secrets.compare_digest(
+        authorization, f"Bearer {settings.gateway_api_key}"
+    ):
+        return True
+    token = websocket.query_params.get("api_key")
+    if token and secrets.compare_digest(token, settings.gateway_api_key):
+        return True
+    return False
 
 
 @asynccontextmanager
@@ -121,3 +141,24 @@ async def chat_completions(
     except Exception as e:
         # 업스트림/입력 오류의 원래 상태 + 본문(실제 사유)을 그대로 노출 (모두 500으로 뭉개지 않음)
         raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
+
+
+@app.websocket("/v1/realtime")
+async def realtime(websocket: WebSocket) -> None:
+    """
+    OpenAI Realtime API 호환 음성 엔드포인트. 내부에서 Gemini Live로 양방향 중계한다.
+    - 모델: `?model=` 쿼리로 지정(미지정 시 settings.realtime_default_model).
+    - 인증: GATEWAY_API_KEY 설정 시 Authorization 헤더 또는 `?api_key=` 필요.
+    텍스트 경로(ProviderPool/fallback)와 독립 — Live는 로컬 대체가 없어 폴백하지 않는다.
+    """
+    if not ws_authorized(websocket):
+        await websocket.close(code=4401)  # 4401: 애플리케이션 정의 Unauthorized
+        return
+
+    bridge = RealtimeBridge(
+        api_key=settings.google_ai_api_key,
+        default_model=settings.realtime_default_model,
+        requested_model=websocket.query_params.get("model"),
+        client_input_rate=settings.realtime_input_sample_rate,
+    )
+    await bridge.run(websocket)

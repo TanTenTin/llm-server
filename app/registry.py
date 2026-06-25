@@ -95,6 +95,14 @@ ALIASES: dict[str, str] = {
 # 기본 모델: GOOGLE_AI_API_KEY 있으면 Gemini, 키 미설정이면 fallback으로 로컬 Ollama
 DEFAULT_MODEL = "gemini-2.5-flash"
 
+# ── Realtime(음성) 모델 별칭 ────────────────────────────────
+# /v1/realtime 의 친화적 별칭 → 실제 Gemini Live 모델 id.
+# 텍스트 모델(MODELS)과 별개의 Live 전용 모델군이라 분리한다.
+# 계정/대시보드에서 사용 가능한 정확한 id로 교체할 것.
+LIVE_ALIASES: dict[str, str] = {
+    "gemini-live": "gemini-2.5-flash-native-audio-preview-09-2025",
+}
+
 # ── auto 라우트 (Phase 2~3) ─────────────────────────────────
 # 클라이언트가 model="auto"로 보내면, 게이트웨이가 직접 모델을 고른다.
 # 후보는 '무료'만, 비용·품질 우선순위 순으로 둔다(free-cloud Gemini → 로컬 Ollama).
@@ -268,6 +276,20 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
     if not chain:
         chain = [MODELS[DEFAULT_MODEL]]
     return RouteDecision(chain=chain, reason=f"auto:tier={tier}")
+
+
+def resolve_live_model(requested: str | None, default: str) -> str:
+    """
+    Realtime 요청 모델명 → Gemini Live 모델 id로 변환한다.
+      1. 요청이 없으면 default 사용
+      2. LIVE_ALIASES 별칭 치환
+      3. Gemini setup이 요구하는 'models/' 접두사를 보장
+    """
+    name = (requested or default or "").strip()
+    name = LIVE_ALIASES.get(name, name)
+    if not name:
+        name = default
+    return name if name.startswith("models/") else f"models/{name}"
 
 
 def route(request: ChatCompletionRequest) -> RouteDecision:
