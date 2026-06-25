@@ -8,6 +8,7 @@
 
 | Provider | 모델 이름 형식 | 비고 |
 |----------|-------------|------|
+| **Gemini** (무료 티어) | `gemini-2.5-flash`, `gemini-2.5-flash-lite` | 기본 provider (`DEFAULT_MODEL`). `GOOGLE_AI_API_KEY` 필요 |
 | **Ollama** (로컬) | `ollama/qwen3:14b` 또는 `qwen3:14b` | Oracle 온프레미스 서버에서 실행 |
 | **Anthropic** | `claude-sonnet-4-6`, `claude-opus-4-7` | API 키 필요 |
 
@@ -90,9 +91,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
+| `GOOGLE_AI_API_KEY` | `""` (빈 값) | Gemini API 키. `gemini-*`(기본 모델) 사용 시 필요. 비면 Gemini 미등록 → 로컬 fallback |
 | `ANTHROPIC_API_KEY` | `""` (빈 값) | Anthropic API 키. `claude-*` 모델 사용 시 필요 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소. Docker 배포 시 compose가 `http://ollama:11434`로 주입 |
 | `GATEWAY_API_KEY` | `""` (빈 값) | 게이트웨이 공유 인증 토큰. 설정 시 `/v1/*` 요청에 `Authorization: Bearer <키>` 필요. **외부 노출 시 반드시 설정** |
+| `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). provider가 일시 장애(429/5xx/연결오류)를 내면 이 시간 동안 폴백 체인 뒤로 미뤄 헛때리는 지연을 제거하고, 만료 시 자동 복귀. `0` 이하면 비활성화 |
 
 ## API
 
@@ -229,12 +232,14 @@ response = await client.chat.completions.create(
 
 - **명시적 prefix가 콜론보다 우선**한다 → 미등록 `claude-x:snapshot`도 Anthropic으로, prefix 없는 `qwen3:14b`는 Ollama로 라우팅된다.
 - **Fallback**: 레지스트리 모델에 `fallback`을 지정하면(예: `claude-sonnet-4-6` → `ollama/qwen3.6:27b`) provider 장애·과부하(연결/타임아웃/5xx/529/모델없음)나 키 미설정 시 다음 후보로 자동 전환된다. 스트리밍은 첫 토큰 전까지만 fallback 가능.
+- **회로차단기(circuit breaker)**: 어떤 provider가 일시 장애(429/5xx/연결오류)를 내면 `BREAKER_COOLDOWN_SECONDS` 동안 그 provider를 폴백 체인 **뒤로 미룬다**. 무료 티어(Gemini)가 429로 막히면 잠깐 로컬(Ollama)을 우선시켜 **매 요청 primary부터 헛때리는 지연을 제거**한다. 쿨다운이 지나면 자동으로 다시 우선순위에 올린다(half-open). 미뤄진 후보도 다른 후보가 모두 실패하면 결국 시도하므로 누락은 없다.
+- **관측성(`x-llm-route` 헤더)**: 응답 본문은 OpenAI 형식 그대로 두고, 실제 라우팅 결과는 `x-llm-route` 응답 헤더로 노출한다 — 예: `requested=gemini-2.5-flash; served=ollama:qwen3:14b; fallback=1`. silent fallback이 일어나도 *무엇이 실제로 응답했는지* 헤더/로그로 바로 확인할 수 있다(호출 측 코드 변경 불필요).
 - **모델 추가/별칭/fallback 변경은 `app/registry.py`의 `MODELS`·`ALIASES`만** 수정하면 된다(`/v1/models` 목록도 자동 반영).
 
 ## 제약사항 / 알려진 한계
 
 - **게이트웨이 자체 인증 없음** — API 키 검증·레이트리밋이 없다. 외부에 노출한다면 reverse proxy 등에서 별도 보호 필요.
-- **silent fallback** — 등록된 claude 모델이 장애·키 미설정이면 fallback 체인의 로컬 Ollama로 조용히 떨어질 수 있다. 실제 사용된 모델은 응답 `model` 필드로 확인.
+- **silent fallback** — 등록된 모델이 장애·키 미설정이면 fallback 체인의 다음 후보(로컬 Ollama 등)로 조용히 떨어질 수 있다. 실제 사용된 모델은 응답 `model` 필드 또는 **`x-llm-route` 헤더**로 확인(헤더에 `served=`·`fallback=1`·`deferred=` 표기).
 - **스트리밍 fallback은 첫 토큰 전까지만** — 토큰이 나가기 시작한 뒤 업스트림이 끊기면 스트림이 중단된다(복구 불가).
 - **`tool_choice`는 Ollama로만 전달** — Anthropic provider는 `tool_choice`를 변환/전달하지 않는다.
 - **Anthropic 멀티턴 tool / 스트리밍 tool_use 미지원** — assistant `tool_calls`를 Anthropic `tool_use`로 역변환하지 않아 tool 왕복 대화가 깨질 수 있고, 스트리밍 시 함수 호출이 누락된다. `finish_reason`도 Anthropic 원본 값(`end_turn` 등)을 그대로 노출한다.

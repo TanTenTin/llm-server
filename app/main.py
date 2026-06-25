@@ -3,13 +3,14 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.models import ChatCompletionRequest
 from app.registry import MODELS, RouteDecision, resolve
 from app.service import (
     ProviderPool,
+    RouteTrace,
     aclose_quietly,
     chat_with_fallback,
     http_status_for,
@@ -59,14 +60,20 @@ async def list_models(_auth: None = Depends(require_auth)) -> dict:
 
 
 async def _streaming_response(
-    request: ChatCompletionRequest, decision: RouteDecision, pool: ProviderPool
+    request: ChatCompletionRequest,
+    decision: RouteDecision,
+    pool: ProviderPool,
+    trace: RouteTrace,
 ) -> StreamingResponse:
     """
     스트리밍 응답 구성. 첫 청크를 엔드포인트의 try/except 안에서 미리 당겨,
     '시작도 못 한' 실패는 일반 HTTP 500으로 변환한다. 첫 청크 이후의 오류는
     이미 응답이 시작됐으므로 스트림 중단으로 나타난다(스트리밍 fallback 한계).
+
+    첫 청크를 당긴 시점에 trace가 채워지므로(실제 응답 provider 확정), 그 직후
+    `x-llm-route` 헤더에 라우팅 결과를 실어 응답 시작 전에 함께 내려보낸다.
     """
-    gen = stream_with_fallback(request, decision, pool)
+    gen = stream_with_fallback(request, decision, pool, trace)
     try:
         first = await gen.__anext__()
     except StopAsyncIteration:
@@ -82,7 +89,11 @@ async def _streaming_response(
             # 클라이언트 조기 종료 등 어떤 경로로 끝나도 업스트림 스트림을 정리(누수 방지)
             await aclose_quietly(gen)
 
-    return StreamingResponse(body(), media_type="text/event-stream")
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        headers={"x-llm-route": trace.header()},
+    )
 
 
 @app.post("/v1/chat/completions", response_model=None)
@@ -93,10 +104,14 @@ async def chat_completions(
     """OpenAI 호환 chat completions 엔드포인트"""
     pool: ProviderPool = app.state.pool
     decision = resolve(request.model)
+    # 실제로 어떤 모델이 응답했는지 관측용 트레이스. 응답 본문은 OpenAI 형식 그대로 두고
+    # (호출 측 SDK 호환 유지), 라우팅 결과는 x-llm-route 헤더로만 노출한다.
+    trace = RouteTrace(requested=request.model)
     try:
         if request.stream:
-            return await _streaming_response(request, decision, pool)
-        return await chat_with_fallback(request, decision, pool)
+            return await _streaming_response(request, decision, pool, trace)
+        body = await chat_with_fallback(request, decision, pool, trace)
+        return JSONResponse(content=body, headers={"x-llm-route": trace.header()})
     except Exception as e:
         # 업스트림/입력 오류의 원래 상태를 그대로 노출 (모두 500으로 뭉개지 않음)
         raise HTTPException(status_code=http_status_for(e), detail=str(e))

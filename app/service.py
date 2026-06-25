@@ -1,3 +1,6 @@
+import logging
+import time
+from dataclasses import dataclass, field
 from typing import AsyncGenerator
 
 import anthropic
@@ -9,7 +12,7 @@ from app.providers.anthropic import AnthropicProvider
 from app.providers.base import LLMProvider
 from app.providers.gemini import GeminiProvider
 from app.providers.ollama import OllamaProvider
-from app.registry import RouteDecision
+from app.registry import ModelSpec, RouteDecision
 
 # fallback을 유발하는 HTTP 상태 (provider가 일시적으로/구조적으로 못 받는 상황)
 #   404: 모델 미로드 · 408/409/429: 일시 과부하 · 5xx: provider 내부 오류
@@ -17,9 +20,73 @@ from app.registry import RouteDecision
 # 400/401/403(입력·인증 오류)는 재시도해도 동일 실패 → 포함하지 않음(즉시 실패)
 _RETRYABLE_STATUS = {404, 408, 409, 429, 500, 502, 503, 504, 529}
 
+logger = logging.getLogger("llm_gateway")
+logger.setLevel(logging.INFO)  # uvicorn 루트 핸들러로 전파되어 출력됨
+
 
 class ProviderUnavailable(Exception):
     """provider가 설정되지 않아(예: API 키 미설정) 사용 불가. fallback 대상으로 취급."""
+
+
+# ─────────────────────────────────────────────────────────────
+# 회로차단기 — provider별 일시 장애를 기억해 쿨다운 동안 뒤로 미룬다
+# ─────────────────────────────────────────────────────────────
+class CircuitBreaker:
+    """
+    provider 단위로 최근 일시 장애를 기록한다. '열림(open)' 상태인 provider는
+    폴백 체인에서 뒤로 미뤄(=primary부터 헛때리는 지연을 제거) 다른 후보를 먼저 시도한다.
+    쿨다운이 지나면 자동으로 닫혀(half-open) 다시 정상 우선순위로 시도된다.
+
+    무료 티어(Gemini)처럼 429가 빈번한 환경에서, 한 번 막히면 잠깐 로컬(Ollama)을
+    우선시켜 응답 지연을 줄이는 것이 목적이다. 단일 프로세스의 코루틴 간 공유 상태로,
+    읽기-쓰기 사이에 await가 없어 별도 락 없이 안전하다.
+    """
+
+    def __init__(self, cooldown_seconds: float) -> None:
+        self._cooldown = cooldown_seconds
+        self._open_until: dict[str, float] = {}  # provider → 이 시각(monotonic)까지 열림
+
+    def is_open(self, provider: str) -> bool:
+        if self._cooldown <= 0:
+            return False  # 쿨다운 0 이하 → 회로차단 비활성화
+        until = self._open_until.get(provider)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            del self._open_until[provider]  # 쿨다운 만료 → 자동 닫힘(half-open)
+            return False
+        return True
+
+    def record_failure(self, provider: str) -> None:
+        if self._cooldown > 0:
+            self._open_until[provider] = time.monotonic() + self._cooldown
+
+    def record_success(self, provider: str) -> None:
+        self._open_until.pop(provider, None)  # 성공하면 즉시 닫음
+
+
+# ─────────────────────────────────────────────────────────────
+# 라우팅 트레이스 — 실제로 어떤 모델이 응답했는지 관측(헤더/로그)
+# ─────────────────────────────────────────────────────────────
+@dataclass
+class RouteTrace:
+    """한 요청에서 어떤 후보를 시도/스킵하고 무엇이 최종 응답했는지 기록(silent fallback 관측용)."""
+    requested: str                                  # 클라이언트가 요청한 모델명
+    served: str | None = None                       # 실제 응답한 spec 라벨 ("provider:upstream")
+    fell_back: bool = False                          # primary가 아닌 후보가 응답했는지
+    attempts: list[str] = field(default_factory=list)   # 시도 이력 (label#ok/#retryable/#unavailable)
+    deferred: list[str] = field(default_factory=list)   # 회로 open으로 뒤로 미뤄진 provider 라벨
+
+    def header(self) -> str:
+        """`x-llm-route` 응답 헤더 값으로 직렬화 (ASCII 안전)."""
+        parts = [f"requested={self.requested}"]
+        if self.served:
+            parts.append(f"served={self.served}")
+        if self.fell_back:
+            parts.append("fallback=1")
+        if self.deferred:
+            parts.append("deferred=" + ",".join(self.deferred))
+        return "; ".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -38,6 +105,8 @@ class ProviderPool:
             self._providers["anthropic"] = AnthropicProvider(settings.anthropic_api_key)
         if settings.google_ai_api_key:
             self._providers["gemini"] = GeminiProvider(settings.google_ai_api_key)
+        # provider별 일시 장애를 기억하는 회로차단기 (폴백 경로에서 참조)
+        self.breaker = CircuitBreaker(settings.breaker_cooldown_seconds)
 
     def get(self, provider_type: str) -> LLMProvider:
         provider = self._providers.get(provider_type)
@@ -53,6 +122,28 @@ class ProviderPool:
 # ─────────────────────────────────────────────────────────────
 # 에러 분류 / 정리 헬퍼
 # ─────────────────────────────────────────────────────────────
+def _spec_label(spec: ModelSpec) -> str:
+    """로그·헤더에 쓸 사람이 읽기 좋은 식별자."""
+    return f"{spec.provider}:{spec.upstream}"
+
+
+def _order_by_breaker(
+    chain: list[ModelSpec], breaker: CircuitBreaker
+) -> tuple[list[ModelSpec], list[str]]:
+    """
+    회로 open 상태인 provider의 후보를 체인 '뒤로' 미룬다(순서만 바꿈, 누락 없음).
+    정상 후보 → (뒤로 미룬) open 후보 순. 모두 open이어도 결국 시도하므로
+    영구 실패로 빠지지 않는다(미뤄진 후보는 회복 탐침 역할도 겸함).
+    반환: (재정렬된 체인, 미뤄진 provider 라벨 목록)
+    """
+    fresh: list[ModelSpec] = []
+    deferred: list[ModelSpec] = []
+    for spec in chain:
+        (deferred if breaker.is_open(spec.provider) else fresh).append(spec)
+    deferred_labels = [_spec_label(s) for s in deferred]
+    return fresh + deferred, deferred_labels
+
+
 def _is_retryable(exc: Exception) -> bool:
     """다음 fallback 후보로 넘어갈 만한 에러인지 판단."""
     # 연결 실패 / 타임아웃 계열
@@ -94,37 +185,77 @@ async def aclose_quietly(gen: AsyncGenerator[str, None]) -> None:
 # Fallback 실행
 # ─────────────────────────────────────────────────────────────
 async def chat_with_fallback(
-    request: ChatCompletionRequest, decision: RouteDecision, pool: ProviderPool
+    request: ChatCompletionRequest,
+    decision: RouteDecision,
+    pool: ProviderPool,
+    trace: RouteTrace | None = None,
 ) -> dict:
     """체인을 순서대로 시도. 미설정 provider/재시도 가능 에러면 다음 후보로."""
+    breaker = pool.breaker
+    ordered, deferred = _order_by_breaker(decision.chain, breaker)
+    if trace is not None:
+        trace.deferred = deferred
+    if deferred:
+        logger.info("[route] 회로 open → 뒤로 미룸: %s", ", ".join(deferred))
+
     last_exc: Exception | None = None
-    for spec in decision.chain:
+    for idx, spec in enumerate(ordered):
+        label = _spec_label(spec)
         try:
             provider = pool.get(spec.provider)
-            return await provider.chat(request, spec)
+            result = await provider.chat(request, spec)
         except ProviderUnavailable as e:
-            last_exc = e            # 미설정 provider → 다음 후보로
+            last_exc = e  # 미설정 provider → 다음 후보로 (회로차단 대상 아님: 영구 설정 문제)
+            if trace is not None:
+                trace.attempts.append(f"{label}#unavailable")
+            continue
         except Exception as e:
             if not _is_retryable(e):
-                raise               # 입력/인증 오류 등은 즉시 실패
-            last_exc = e            # 재시도 가능 → 다음 후보로
+                raise  # 입력/인증 오류 등은 즉시 실패
+            breaker.record_failure(spec.provider)  # 일시 장애 → 회로 open
+            last_exc = e
+            if trace is not None:
+                trace.attempts.append(f"{label}#retryable")
+            logger.warning("[route] %s 일시 장애(%s) → 회로 open, 다음 후보로", label, type(e).__name__)
+            continue
+        # 성공
+        breaker.record_success(spec.provider)
+        if trace is not None:
+            trace.served = label
+            trace.fell_back = idx > 0 or bool(deferred)
+            trace.attempts.append(f"{label}#ok")
+        logger.info("[route] 요청=%s → 응답=%s (fallback=%s)", request.model, label, idx > 0 or bool(deferred))
+        return result
     raise last_exc if last_exc is not None else RuntimeError("라우팅 후보가 없습니다")
 
 
 async def stream_with_fallback(
-    request: ChatCompletionRequest, decision: RouteDecision, pool: ProviderPool
+    request: ChatCompletionRequest,
+    decision: RouteDecision,
+    pool: ProviderPool,
+    trace: RouteTrace | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     스트리밍 fallback — 첫 청크를 받기 전에 실패한 후보만 건너뛴다.
     한 번 토큰을 내보낸 뒤에는(이미 바이트를 전송했으므로) fallback 불가하며,
     어떤 경로로 끝나든 업스트림 제너레이터를 반드시 정리한다(커넥션 누수 방지).
     """
+    breaker = pool.breaker
+    ordered, deferred = _order_by_breaker(decision.chain, breaker)
+    if trace is not None:
+        trace.deferred = deferred
+    if deferred:
+        logger.info("[route] 회로 open → 뒤로 미룸: %s", ", ".join(deferred))
+
     last_exc: Exception | None = None
-    for spec in decision.chain:
+    for idx, spec in enumerate(ordered):
+        label = _spec_label(spec)
         try:
             provider = pool.get(spec.provider)
         except ProviderUnavailable as e:
             last_exc = e
+            if trace is not None:
+                trace.attempts.append(f"{label}#unavailable")
             continue
 
         gen = provider.stream(request, spec)
@@ -134,15 +265,30 @@ async def stream_with_fallback(
             first = await gen.__anext__()
         except StopAsyncIteration:
             await aclose_quietly(gen)
+            breaker.record_success(spec.provider)  # 빈 스트림이라도 연결은 정상
+            if trace is not None:
+                trace.served = label
+                trace.fell_back = idx > 0 or bool(deferred)
+                trace.attempts.append(f"{label}#ok-empty")
             return  # 빈 스트림
         except Exception as e:
             await aclose_quietly(gen)
             if not _is_retryable(e):
                 raise
+            breaker.record_failure(spec.provider)  # 일시 장애 → 회로 open
             last_exc = e
+            if trace is not None:
+                trace.attempts.append(f"{label}#retryable")
+            logger.warning("[route] %s 스트림 시작 실패(%s) → 회로 open, 다음 후보로", label, type(e).__name__)
             continue
 
         # 첫 청크 확보 — 이후엔 fallback 없이 끝까지 흘려보내되 항상 정리
+        breaker.record_success(spec.provider)
+        if trace is not None:
+            trace.served = label
+            trace.fell_back = idx > 0 or bool(deferred)
+            trace.attempts.append(f"{label}#ok")
+        logger.info("[route] 요청=%s → 스트림=%s (fallback=%s)", request.model, label, idx > 0 or bool(deferred))
         try:
             yield first
             async for chunk in gen:

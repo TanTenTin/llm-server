@@ -10,10 +10,13 @@ class ModelSpec:
     하나의 모델을 어떤 provider로, 어떤 upstream 이름으로 호출할지에 대한 정의.
     라우팅·모델명 변환의 단일 진실 공급원(SSOT).
     """
-    provider: str                              # "ollama" | "anthropic"
+    provider: str                              # "ollama" | "anthropic" | "gemini"
     upstream: str                              # provider에 실제로 보낼 모델명
     max_tokens: int | None = None              # 기본 max_tokens (요청에 없을 때 사용)
     fallback: list[str] = field(default_factory=list)  # 실패 시 시도할 다른 모델 키
+    # ── 비용/특성 메타 (Phase 1: 로그·헤더 표시용 / Phase 2: 자동선택 판단 근거) ──
+    cost_tier: str = "local"                   # "local"(자가호스팅) | "free-cloud"(무료 티어) | "paid"(과금)
+    is_free: bool = True                       # 한계비용 0 여부 (무료 티어·로컬=True, 과금 API=False)
 
 
 @dataclass(frozen=True)
@@ -31,11 +34,15 @@ MODELS: dict[str, ModelSpec] = {
         provider="gemini",
         upstream="gemini-2.5-flash",
         fallback=["ollama/qwen3:14b"],      # 키 미설정 또는 장애 시 로컬로 폴백
+        cost_tier="free-cloud",
+        is_free=True,
     ),
     "gemini-2.5-flash-lite": ModelSpec(
         provider="gemini",
         upstream="gemini-2.5-flash-lite",
         fallback=["ollama/qwen3:14b"],
+        cost_tier="free-cloud",
+        is_free=True,
     ),
     # ── Anthropic ───────────────────────────────────────────────
     "claude-sonnet-4-6": ModelSpec(
@@ -43,12 +50,16 @@ MODELS: dict[str, ModelSpec] = {
         upstream="claude-sonnet-4-6",
         max_tokens=8192,
         fallback=["ollama/qwen3.6:27b"],
+        cost_tier="paid",
+        is_free=False,
     ),
     "claude-opus-4-7": ModelSpec(
         provider="anthropic",
         upstream="claude-opus-4-7",
         max_tokens=8192,
         fallback=["ollama/qwen3.6:27b"],
+        cost_tier="paid",
+        is_free=False,
     ),
     # ── Ollama (로컬) ────────────────────────────────────────────
     "ollama/qwen3:14b": ModelSpec(provider="ollama", upstream="qwen3:14b"),
@@ -82,13 +93,19 @@ def _passthrough_spec(model: str) -> ModelSpec | None:
     if model.startswith("ollama/"):
         return ModelSpec(provider="ollama", upstream=model.removeprefix("ollama/"))
     if model.startswith("anthropic/"):
-        return ModelSpec(provider="anthropic", upstream=model.removeprefix("anthropic/"))
+        return ModelSpec(
+            provider="anthropic", upstream=model.removeprefix("anthropic/"),
+            cost_tier="paid", is_free=False,
+        )
     if model.startswith("gemini/"):
-        return ModelSpec(provider="gemini", upstream=model.removeprefix("gemini/"))
+        return ModelSpec(
+            provider="gemini", upstream=model.removeprefix("gemini/"),
+            cost_tier="free-cloud", is_free=True,
+        )
     if model.startswith("claude-"):
-        return ModelSpec(provider="anthropic", upstream=model)
+        return ModelSpec(provider="anthropic", upstream=model, cost_tier="paid", is_free=False)
     if model.startswith("gemini-"):
-        return ModelSpec(provider="gemini", upstream=model)
+        return ModelSpec(provider="gemini", upstream=model, cost_tier="free-cloud", is_free=True)
     if ":" in model:
         return ModelSpec(provider="ollama", upstream=model)
     return None
