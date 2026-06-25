@@ -61,7 +61,7 @@ MODELS: dict[str, ModelSpec] = {
         provider="anthropic",
         upstream="claude-sonnet-4-6",
         max_tokens=8192,
-        fallback=["ollama/qwen3.6:27b"],
+        fallback=["ollama/qwen3:14b"],
         cost_tier="paid",
         is_free=False,
         supports_tools=True,
@@ -71,19 +71,17 @@ MODELS: dict[str, ModelSpec] = {
         provider="anthropic",
         upstream="claude-opus-4-7",
         max_tokens=8192,
-        fallback=["ollama/qwen3.6:27b"],
+        fallback=["ollama/qwen3:14b"],
         cost_tier="paid",
         is_free=False,
         supports_tools=True,
         context_window=200_000,
     ),
     # ── Ollama (로컬) ────────────────────────────────────────────
+    # 서버에 실제 pull된 모델만 등록한다. qwen3.6:27b는 미설치(404)라 제거함.
+    # 추후 'ollama pull qwen3.6:27b' 후 다시 등록하면 fallback/auto 후보로 쓸 수 있다.
     "ollama/qwen3:14b": ModelSpec(
         provider="ollama", upstream="qwen3:14b",
-        supports_tools=True, context_window=32_000,
-    ),
-    "ollama/qwen3.6:27b": ModelSpec(
-        provider="ollama", upstream="qwen3.6:27b",
         supports_tools=True, context_window=32_000,
     ),
 }
@@ -104,11 +102,11 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 #
 # Phase 3: 요청 난이도(simple/complex)를 먼저 판단해 티어별로 후보 셋을 다르게 쓴다.
 #   simple  → 가볍고 빠른 모델(flash-lite, 14b)   : 인사·단순 질의·짧은 대화
-#   complex → 강한 모델(flash, 27b)               : 도구 사용·긴 입력·다중턴·추론성 키워드
+#   complex → 강한 모델(flash, 로컬은 14b)        : 도구 사용·긴 입력·다중턴·추론성 키워드
 AUTO_ROUTE = "auto"
 AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
     "simple": ["gemini-2.5-flash-lite", "ollama/qwen3:14b"],
-    "complex": ["gemini-2.5-flash", "ollama/qwen3.6:27b"],
+    "complex": ["gemini-2.5-flash", "ollama/qwen3:14b"],
 }
 
 # 토큰 추정 계수: char 수 → 대략의 토큰 수(한글/혼합 보수적으로 3 chars/token 가정).

@@ -67,7 +67,7 @@ POST /v1/chat/completions
 `model="auto"`면 요청 특성으로 게이트웨이가 직접 모델 선택:
 - **난이도 분기(Phase 3)**: `_classify_complexity()`가 simple/complex 판단 → `AUTO_CANDIDATES_BY_TIER[tier]` 선택.
   - complex 조건(하나라도): `tools` 사용 / `_estimate_tokens` ≥ `_COMPLEX_TOKEN_THRESHOLD(1200)` / 메시지 수 ≥ `_COMPLEX_MESSAGE_COUNT(6)` / 사용자 메시지에 `_COMPLEX_KEYWORDS` 포함.
-  - simple → [gemini-2.5-flash-lite, ollama/qwen3:14b] / complex → [gemini-2.5-flash, ollama/qwen3.6:27b]. 모두 무료, **과금(Claude) 미포함**(비용 0 보장).
+  - simple → [gemini-2.5-flash-lite, ollama/qwen3:14b] / complex → [gemini-2.5-flash, ollama/qwen3:14b]. 모두 무료, **과금(Claude) 미포함**(비용 0 보장).
 - **capability 필터(Phase 2)**: `tools` 있는데 `supports_tools=False`면 제외, `_estimate_tokens()`(문자수÷`_CHARS_PER_TOKEN=3`) > `context_window`면 제외. 모두 탈락 시 DEFAULT_MODEL로 폴백.
 - 선택 사유는 `RouteDecision.reason`("auto:tier=...")으로 실려 `x-llm-route` 헤더에 `reason=`으로 노출. 살아남은 후보가 그대로 체인이 되어 Phase 1 회로차단기·폴백 동일 적용.
 - capability 메타는 `ModelSpec.supports_tools`·`context_window`(MODELS에서 모델별 지정).
