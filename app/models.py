@@ -1,19 +1,31 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Any, Literal, Union
+
+# 모든 요청 모델 공통 설정: 모델에 선언하지 않은 필드도 '버리지 않고 보존'한다(extra="allow").
+# 게이트웨이는 OpenAI 호환 요청을 그대로 받아 passthrough(Gemini·Ollama)로 흘려보내는데,
+# Pydantic 기본값(extra="ignore")이면 모델이 모르는 필드를 조용히 버려 업스트림에 손실이 생긴다.
+# (멀티턴 도구 왕복의 tool_calls 누락 → 400 이 정확히 이 문제였다.)
+_ALLOW_EXTRA = ConfigDict(extra="allow")
 
 
 class ToolFunction(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     name: str
     description: Optional[str] = None
     parameters: Optional[dict] = None
 
 
 class Tool(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     type: Literal["function"] = "function"
     function: ToolFunction
 
 
 class Message(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     role: str
     # OpenAI 스펙상 assistant가 tool_calls만 내는 메시지의 content는 null일 수 있다 → Optional.
     # (null 불가로 두면 opencode 등 멀티턴 도구 왕복에서 422가 난다)
@@ -28,6 +40,8 @@ class Message(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     model: str
     messages: List[Message]
     temperature: Optional[float] = None

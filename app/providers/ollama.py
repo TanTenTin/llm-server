@@ -6,6 +6,7 @@ from typing import AsyncGenerator
 
 from app.models import ChatCompletionRequest
 from app.providers.base import LLMProvider
+from app.providers.openai_payload import build_openai_payload
 from app.registry import ModelSpec
 
 TIMEOUT = 120.0
@@ -18,22 +19,8 @@ class OllamaProvider(LLMProvider):
         self.client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=TIMEOUT)
 
     def _build_payload(self, request: ChatCompletionRequest, spec: ModelSpec) -> dict:
-        payload: dict = {
-            "model": spec.upstream,
-            "messages": [msg.model_dump(exclude_none=True) for msg in request.messages],
-            "stream": request.stream or False,
-        }
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        # 요청값 우선, 없으면 레지스트리 기본값
-        max_tokens = request.max_tokens or spec.max_tokens
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if request.tools:
-            payload["tools"] = [tool.model_dump() for tool in request.tools]
-        if request.tool_choice:
-            payload["tool_choice"] = request.tool_choice
-        return payload
+        # 공용 OpenAI 패스스루 빌더 사용 (think는 네이티브 /api/chat 경로에서 별도 처리)
+        return build_openai_payload(request, spec)
 
     def _build_native_payload(self, request: ChatCompletionRequest, spec: ModelSpec) -> dict:
         # /api/chat 네이티브 엔드포인트용 payload.

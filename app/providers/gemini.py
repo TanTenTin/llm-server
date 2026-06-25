@@ -3,6 +3,7 @@ from typing import AsyncGenerator
 
 from app.models import ChatCompletionRequest
 from app.providers.base import LLMProvider
+from app.providers.openai_payload import build_openai_payload
 from app.registry import ModelSpec
 
 # Gemini는 OpenAI 호환 엔드포인트를 제공함.
@@ -20,19 +21,8 @@ class GeminiProvider(LLMProvider):
         )
 
     def _build_payload(self, request: ChatCompletionRequest, spec: ModelSpec) -> dict:
-        payload: dict = {
-            "model": spec.upstream,
-            "messages": [msg.model_dump(exclude_none=True) for msg in request.messages],
-            "stream": request.stream or False,
-        }
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        max_tokens = request.max_tokens or spec.max_tokens
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if request.tools:
-            payload["tools"] = [tool.model_dump() for tool in request.tools]
-        return payload
+        # 공용 OpenAI 패스스루 빌더 사용 — 메시지 구조(tool_calls 등) 보존 + 표준 파라미터 전달
+        return build_openai_payload(request, spec)
 
     async def chat(self, request: ChatCompletionRequest, spec: ModelSpec) -> dict:
         payload = self._build_payload(request, spec)

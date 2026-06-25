@@ -27,7 +27,8 @@ app/
 ├── service.py     — ProviderPool(인스턴스 재사용) + CircuitBreaker + RouteTrace + fallback 실행 + 에러 분류
 └── providers/
     ├── base.py       — LLMProvider ABC: chat(request, spec) / stream(request, spec) / aclose()
-    ├── ollama.py     — Ollama의 OpenAI 호환 API로 그대로 프록시 (영속 httpx client)
+    ├── openai_payload.py — OpenAI 패스스루 payload 공용 빌더(build_openai_payload). Gemini·Ollama 공용
+    ├── ollama.py     — Ollama의 OpenAI 호환 API로 프록시(+think는 네이티브 /api/chat 경로)
     ├── gemini.py     — Gemini의 OpenAI 호환 엔드포인트로 프록시 (영속 httpx client, Bearer 인증)
     └── anthropic.py  — OpenAI ↔ Anthropic 포맷 변환 후 SDK 호출 (client 재사용)
 ```
@@ -110,7 +111,8 @@ OpenAI와 Anthropic의 차이가 있어서 변환 로직이 들어있다. 수정
 
 - **에러 상태 코드**: `http_status_for()`가 `httpx.HTTPStatusError`/`anthropic.APIStatusError`의 status를 그대로 노출, 연결 실패는 502, `ProviderUnavailable`은 503, 그 외 500. (예전처럼 전부 500이 아님)
 - **`/v1/models`는 레지스트리(MODELS)에서 자동 생성**. 모델 추가는 `registry.py`만 손대면 목록에도 반영됨.
-- **`tool_choice`는 Ollama로만 전달**: `AnthropicProvider`는 `tool_choice`를 변환/전달하지 않음.
+- **`tool_choice`는 OpenAI 패스스루(Gemini·Ollama)로 전달**: `AnthropicProvider`만 `tool_choice`를 변환/전달하지 않음.
+- **패스스루 미지 필드 보존(extra="allow")**: `models.py`의 요청/메시지 모델이 `extra="allow"`라 모델이 모르는 메시지 구조 필드(예: `tool_calls`)도 버리지 않고 업스트림에 전달. 요청 레벨 파라미터는 `openai_payload.build_openai_payload`의 `_FORWARD_PARAMS` 화이트리스트로 전달(미지의 요청 레벨 필드는 무차별 전달하지 않음 — 메시지 보존/요청 파라미터 선별). passthrough 손실은 `tests/test_passthrough.py`가 회귀로 막음.
 - **silent fallback 주의**: 등록된 모델이 404/연결오류거나 키 미설정이면 fallback 체인의 다음 후보(로컬 Ollama 등)로 조용히 떨어질 수 있다. 실제 사용된 모델은 응답 `model` 필드 또는 **`x-llm-route` 헤더**로 확인.
 - **게이트웨이 자체 인증 없음**: 앞단에 인증/레이트리밋 없음. 외부 노출 시 별도 보호 필요.
 
@@ -137,7 +139,7 @@ uvicorn app.main:app --reload          # 개발 (자동 리로드)
 # 운영: uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-- 테스트 코드 없음 (pytest 미구성). 추가 시 `tests/` 디렉터리 사용.
+- 테스트: `tests/test_passthrough.py`(pytest). 실행: `pip install pytest && python -m pytest tests/ -q`. passthrough payload의 tool_calls 보존·미지 필드 보존·파라미터 전달을 회귀로 검증. 배포 이미지에는 pytest 미포함(런타임 비대화 방지).
 
 ## 로컬 Ollama 모델
 

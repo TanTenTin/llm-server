@@ -264,7 +264,8 @@ response = await client.chat.completions.create(
 - **게이트웨이 자체 인증 없음** — API 키 검증·레이트리밋이 없다. 외부에 노출한다면 reverse proxy 등에서 별도 보호 필요.
 - **silent fallback** — 등록된 모델이 장애·키 미설정이면 fallback 체인의 다음 후보(로컬 Ollama 등)로 조용히 떨어질 수 있다. 실제 사용된 모델은 응답 `model` 필드 또는 **`x-llm-route` 헤더**로 확인(헤더에 `served=`·`fallback=1`·`deferred=` 표기).
 - **스트리밍 fallback은 첫 토큰 전까지만** — 토큰이 나가기 시작한 뒤 업스트림이 끊기면 스트림이 중단된다(복구 불가).
-- **`tool_choice`는 Ollama로만 전달** — Anthropic provider는 `tool_choice`를 변환/전달하지 않는다.
+- **`tool_choice`는 OpenAI 패스스루(Gemini·Ollama)로 전달** — Anthropic provider는 여전히 `tool_choice`를 변환/전달하지 않는다.
+- **OpenAI 패스스루는 미지 필드를 보존한다** — 요청/메시지 모델이 `extra="allow"`라, 게이트웨이가 모르는 메시지 구조 필드(예: `tool_calls`)도 버리지 않고 그대로 업스트림에 전달한다. 요청 레벨 파라미터는 `app/providers/openai_payload.py`의 화이트리스트(`temperature`·`top_p`·`stop`·`response_format`·`tool_choice` 등)로 전달하며, 미지의 요청 레벨 필드는 엄격한 업스트림의 400을 피하려 전달하지 않는다(메시지는 보존, 요청 파라미터는 선별).
 - **Anthropic 멀티턴 tool / 스트리밍 tool_use 미지원** — assistant `tool_calls`를 Anthropic `tool_use`로 역변환하지 않아 tool 왕복 대화가 깨질 수 있고, 스트리밍 시 함수 호출이 누락된다. `finish_reason`도 Anthropic 원본 값(`end_turn` 등)을 그대로 노출한다.
 
 ## 프로젝트 구조
