@@ -235,10 +235,13 @@ response = await client.chat.completions.create(
 
 `model="auto"`로 보내면 게이트웨이가 **요청 특성을 보고 직접 모델을 고른다**. 클라이언트는 어떤 모델이 있는지 몰라도 된다.
 
-- **후보**: 무료만(`AUTO_CANDIDATES` = `gemini-2.5-flash` → `ollama/qwen3:14b`), 비용·품질 우선순위 순. **과금(Claude)은 auto가 자동 선택하지 않는다**(비용 0 보장 — Claude가 필요하면 모델명을 명시).
+- **난이도 분기(`tier`)**: 먼저 요청 난이도를 `simple`/`complex`로 판단해 티어별 후보 셋을 고른다.
+  - `simple` → `gemini-2.5-flash-lite` → `ollama/qwen3:14b` (가볍고 빠름): 인사·단순 단발 질의
+  - `complex` → `gemini-2.5-flash` → `ollama/qwen3.6:27b` (강한 모델): 도구 사용·긴 입력(≥1200토큰)·긴 멀티턴(≥6메시지)·추론성 키워드(분석/설계/디버그/구현 등)
+- **후보**: 무료만, 비용·품질 우선순위 순. **과금(Claude)은 auto가 자동 선택하지 않는다**(비용 0 보장 — Claude가 필요하면 모델명을 명시).
 - **필터**: 도구(`tools`)를 쓰는 요청인데 도구 미지원 모델은 제외, 추정 입력 토큰이 `context_window`를 초과하는 모델은 제외. (예: 입력이 ~66k 토큰이면 32k 로컬은 빠지고 1M Gemini만 남는다.)
 - **토큰 추정**: 메시지+도구 정의의 문자 수 ÷ 3 (정확한 토큰화가 아니라 "로컬에 들어가나, 큰 컨텍스트가 필요한가" 판단용 근사치).
-- 살아남은 후보가 그대로 폴백 체인이 되므로, 위의 **회로차단기·`x-llm-route` 헤더가 동일하게 적용**된다.
+- 선택 사유는 `x-llm-route` 헤더에 `reason=auto:tier=complex`로 노출된다. 살아남은 후보가 그대로 폴백 체인이 되므로 **회로차단기·`x-llm-route` 헤더가 동일하게 적용**된다.
 
 - **명시적 prefix가 콜론보다 우선**한다 → 미등록 `claude-x:snapshot`도 Anthropic으로, prefix 없는 `qwen3:14b`는 Ollama로 라우팅된다.
 - **Fallback**: 레지스트리 모델에 `fallback`을 지정하면(예: `claude-sonnet-4-6` → `ollama/qwen3.6:27b`) provider 장애·과부하(연결/타임아웃/5xx/529/모델없음)나 키 미설정 시 다음 후보로 자동 전환된다. 스트리밍은 첫 토큰 전까지만 fallback 가능.

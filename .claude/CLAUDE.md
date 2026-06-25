@@ -61,12 +61,14 @@ POST /v1/chat/completions
 | 3. 패스스루 | 미등록이라도 형태로 추론: `gemini-`/`gemini/` → Gemini, `ollama/` → Ollama, `anthropic/`·`claude-` → Anthropic, 그 외 `:` 포함 → Ollama |
 | 4. 기본값 | 위 어디에도 안 걸리면 `DEFAULT_MODEL`(gemini-2.5-flash, 키 없으면 로컬 폴백) |
 
-### auto 라우트 (Phase 2 — `_auto_route`)
+### auto 라우트 (Phase 2~3 — `_auto_route`)
 
 `model="auto"`면 요청 특성으로 게이트웨이가 직접 모델 선택:
-- **후보**: `AUTO_CANDIDATES`(무료만: gemini-2.5-flash → ollama/qwen3:14b), 비용·품질 우선순위 순. **과금(Claude) 미포함** — 비용 0 보장, Claude는 명시적 지정 필요.
-- **필터**: `tools` 있는데 `supports_tools=False`면 제외, `_estimate_tokens()`(문자수÷`_CHARS_PER_TOKEN=3`) > `context_window`면 제외. 모두 탈락 시 DEFAULT_MODEL로 폴백.
-- 살아남은 후보가 그대로 체인이 되어 Phase 1 회로차단기·`x-llm-route`가 동일 적용.
+- **난이도 분기(Phase 3)**: `_classify_complexity()`가 simple/complex 판단 → `AUTO_CANDIDATES_BY_TIER[tier]` 선택.
+  - complex 조건(하나라도): `tools` 사용 / `_estimate_tokens` ≥ `_COMPLEX_TOKEN_THRESHOLD(1200)` / 메시지 수 ≥ `_COMPLEX_MESSAGE_COUNT(6)` / 사용자 메시지에 `_COMPLEX_KEYWORDS` 포함.
+  - simple → [gemini-2.5-flash-lite, ollama/qwen3:14b] / complex → [gemini-2.5-flash, ollama/qwen3.6:27b]. 모두 무료, **과금(Claude) 미포함**(비용 0 보장).
+- **capability 필터(Phase 2)**: `tools` 있는데 `supports_tools=False`면 제외, `_estimate_tokens()`(문자수÷`_CHARS_PER_TOKEN=3`) > `context_window`면 제외. 모두 탈락 시 DEFAULT_MODEL로 폴백.
+- 선택 사유는 `RouteDecision.reason`("auto:tier=...")으로 실려 `x-llm-route` 헤더에 `reason=`으로 노출. 살아남은 후보가 그대로 체인이 되어 Phase 1 회로차단기·폴백 동일 적용.
 - capability 메타는 `ModelSpec.supports_tools`·`context_window`(MODELS에서 모델별 지정).
 
 > 패스스루는 **명시적 prefix 단서(`ollama/`/`anthropic/`/`claude-`)를 콜론보다 먼저** 평가한다. 따라서 미등록 `claude-x:snapshot` 도 Anthropic으로 가고, `qwen3:14b` 처럼 prefix 없이 콜론만 있는 건 Ollama로 간다.

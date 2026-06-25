@@ -110,7 +110,8 @@ async def chat_completions(
     decision = route(request)  # auto면 요청 특성 기반 선택, 그 외엔 이름 기반
     # 실제로 어떤 모델이 응답했는지 관측용 트레이스. 응답 본문은 OpenAI 형식 그대로 두고
     # (호출 측 SDK 호환 유지), 라우팅 결과는 x-llm-route 헤더로만 노출한다.
-    trace = RouteTrace(requested=request.model)
+    # decision.reason(auto:tier=... 등 선택 사유)을 헤더에 함께 싣는다.
+    trace = RouteTrace(requested=request.model, reason=decision.reason)
     try:
         if request.stream:
             return await _streaming_response(request, decision, pool, trace)

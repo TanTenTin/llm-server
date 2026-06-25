@@ -74,6 +74,7 @@ class RouteTrace:
     requested: str                                  # 클라이언트가 요청한 모델명
     served: str | None = None                       # 실제 응답한 spec 라벨 ("provider:upstream")
     fell_back: bool = False                          # primary가 아닌 후보가 응답했는지
+    reason: str | None = None                        # 선택 사유 (auto:tier=complex 등). RouteDecision에서 주입
     attempts: list[str] = field(default_factory=list)   # 시도 이력 (label#ok/#retryable/#unavailable)
     deferred: list[str] = field(default_factory=list)   # 회로 open으로 뒤로 미뤄진 provider 라벨
 
@@ -84,6 +85,8 @@ class RouteTrace:
             parts.append(f"served={self.served}")
         if self.fell_back:
             parts.append("fallback=1")
+        if self.reason:
+            parts.append(f"reason={self.reason}")
         if self.deferred:
             parts.append("deferred=" + ",".join(self.deferred))
         return "; ".join(parts)

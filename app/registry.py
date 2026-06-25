@@ -27,8 +27,10 @@ class ModelSpec:
 
 @dataclass(frozen=True)
 class RouteDecision:
-    """resolve() 결과. 시도 순서대로 정렬된 spec 체인 (primary + fallback들)."""
+    """resolve()/route() 결과. 시도 순서대로 정렬된 spec 체인 (primary + fallback들)."""
     chain: list[ModelSpec]
+    # 선택 사유(관측용). auto 라우트면 "auto:tier=complex" 등, 그 외엔 None.
+    reason: str | None = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -95,24 +97,42 @@ ALIASES: dict[str, str] = {
 # 기본 모델: GOOGLE_AI_API_KEY 있으면 Gemini, 키 미설정이면 fallback으로 로컬 Ollama
 DEFAULT_MODEL = "gemini-2.5-flash"
 
-# ── auto 라우트 (Phase 2) ───────────────────────────────────
-# 클라이언트가 model="auto"로 보내면, 요청 특성(도구 유무·입력 길이)에 맞춰
-# 게이트웨이가 직접 모델을 고른다. 후보는 '무료'만, 비용·품질 우선순위 순으로 둔다
-# (free-cloud Gemini → 로컬 Ollama). 과금(Claude)은 auto에서 자동 선택하지 않는다
-# — 비용 0을 보장하기 위함. Claude가 필요하면 명시적으로 모델명을 지정해야 한다.
+# ── auto 라우트 (Phase 2~3) ─────────────────────────────────
+# 클라이언트가 model="auto"로 보내면, 게이트웨이가 직접 모델을 고른다.
+# 후보는 '무료'만, 비용·품질 우선순위 순으로 둔다(free-cloud Gemini → 로컬 Ollama).
+# 과금(Claude)은 auto에서 자동 선택하지 않는다 — 비용 0 보장. Claude가 필요하면 명시 지정.
+#
+# Phase 3: 요청 난이도(simple/complex)를 먼저 판단해 티어별로 후보 셋을 다르게 쓴다.
+#   simple  → 가볍고 빠른 모델(flash-lite, 14b)   : 인사·단순 질의·짧은 대화
+#   complex → 강한 모델(flash, 27b)               : 도구 사용·긴 입력·다중턴·추론성 키워드
 AUTO_ROUTE = "auto"
-AUTO_CANDIDATES = ["gemini-2.5-flash", "ollama/qwen3:14b"]
+AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
+    "simple": ["gemini-2.5-flash-lite", "ollama/qwen3:14b"],
+    "complex": ["gemini-2.5-flash", "ollama/qwen3.6:27b"],
+}
 
 # 토큰 추정 계수: char 수 → 대략의 토큰 수(한글/혼합 보수적으로 3 chars/token 가정).
 # 정확한 토큰화가 아니라 "32k 로컬에 들어가나, 1M 클라우드가 필요한가" 판단용 근사치.
 _CHARS_PER_TOKEN = 3
 
-# DEFAULT_MODEL·AUTO_CANDIDATES는 반드시 MODELS에 존재해야 함 (기동 시점에 즉시 검증)
+# 난이도 분류 임계값 — 아래 중 하나라도 걸리면 complex로 본다.
+_COMPLEX_TOKEN_THRESHOLD = 1200        # 추정 입력 토큰 (긴 입력 = 복잡)
+_COMPLEX_MESSAGE_COUNT = 6             # 메시지 수 (긴 대화 = 복잡)
+# 추론·생성 부담이 큰 작업을 시사하는 키워드(한/영, 소문자 비교). 단순 조회와 구분용.
+_COMPLEX_KEYWORDS = (
+    "분석", "설계", "구현", "디버그", "리팩터", "리팩토링", "최적화", "비교", "요약",
+    "단계", "이유", "왜 ", "원인", "증명", "알고리즘", "전략", "계획", "검토", "리뷰",
+    "오류", "버그", "코드", "작성해", "만들어",
+    "analyze", "design", "implement", "debug", "refactor", "optimize", "compare",
+    "summarize", "explain", "why", "algorithm", "review", "strategy", "plan",
+)
+
+# DEFAULT_MODEL·auto 후보는 반드시 MODELS에 존재해야 함 (기동 시점에 즉시 검증)
 if DEFAULT_MODEL not in MODELS:
     raise ValueError(f"DEFAULT_MODEL '{DEFAULT_MODEL}' 가 MODELS에 없습니다")
-for _name in AUTO_CANDIDATES:
+for _name in {n for names in AUTO_CANDIDATES_BY_TIER.values() for n in names}:
     if _name not in MODELS:
-        raise ValueError(f"AUTO_CANDIDATES '{_name}' 가 MODELS에 없습니다")
+        raise ValueError(f"AUTO 후보 '{_name}' 가 MODELS에 없습니다")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -200,19 +220,46 @@ def _estimate_tokens(request: ChatCompletionRequest) -> int:
     return chars // _CHARS_PER_TOKEN
 
 
+def _classify_complexity(request: ChatCompletionRequest) -> str:
+    """
+    요청 난이도를 'simple' | 'complex'로 분류한다(추가 LLM 호출 없는 휴리스틱).
+    아래 중 하나라도 걸리면 complex:
+      - 도구(tools) 사용 (function calling 오케스트레이션은 강한 모델이 유리)
+      - 추정 입력 토큰 ≥ _COMPLEX_TOKEN_THRESHOLD (긴 입력)
+      - 메시지 수 ≥ _COMPLEX_MESSAGE_COUNT (긴 멀티턴)
+      - 사용자 메시지에 추론/생성 부담 키워드 포함
+    그 외(짧은 단발 질의·인사 등)는 simple.
+    """
+    if request.tools:
+        return "complex"
+    if _estimate_tokens(request) >= _COMPLEX_TOKEN_THRESHOLD:
+        return "complex"
+    if len(request.messages) >= _COMPLEX_MESSAGE_COUNT:
+        return "complex"
+    text = " ".join(
+        message.content for message in request.messages
+        if isinstance(message.content, str)
+    ).lower()
+    if any(keyword in text for keyword in _COMPLEX_KEYWORDS):
+        return "complex"
+    return "simple"
+
+
 def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
     """
-    model="auto" 처리. 무료 후보(AUTO_CANDIDATES)를 요청 특성으로 필터링한다.
+    model="auto" 처리. 먼저 난이도(simple/complex)를 판단해 티어별 후보 셋을 고르고,
+    그 후보를 요청 특성으로 필터링한다.
       - 도구를 쓰는 요청인데 도구 미지원 모델 → 제외
       - 추정 입력 토큰이 context_window를 초과하는 모델 → 제외
     살아남은 후보를 비용·품질 우선순위(정의된 순서) 그대로 체인으로 만든다.
     모두 탈락하면(예: 입력이 모든 무료 후보의 컨텍스트를 초과) DEFAULT_MODEL로 폴백한다.
     """
+    tier = _classify_complexity(request)
     needs_tools = bool(request.tools)
     estimated_tokens = _estimate_tokens(request)
 
     chain: list[ModelSpec] = []
-    for name in AUTO_CANDIDATES:
+    for name in AUTO_CANDIDATES_BY_TIER[tier]:
         spec = MODELS[name]
         if needs_tools and not spec.supports_tools:
             continue
@@ -222,7 +269,7 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
 
     if not chain:
         chain = [MODELS[DEFAULT_MODEL]]
-    return RouteDecision(chain=chain)
+    return RouteDecision(chain=chain, reason=f"auto:tier={tier}")
 
 
 def route(request: ChatCompletionRequest) -> RouteDecision:
