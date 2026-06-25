@@ -163,6 +163,24 @@ def _is_retryable(exc: Exception) -> bool:
     return status in _RETRYABLE_STATUS if status is not None else False
 
 
+def error_detail(exc: Exception) -> str:
+    """
+    클라이언트(및 로그)에 돌려줄 상세 메시지. 업스트림 HTTP 에러면 **응답 본문(실제 사유)**을
+    함께 노출한다 — 예전엔 httpx의 일반 메시지만 나와 Gemini의 400 사유가 가려졌다.
+    스트리밍 경로는 provider에서 body를 미리 읽어둬야 여기서 .text가 채워진다.
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        try:
+            body = exc.response.text
+        except Exception:
+            body = ""
+        return f"{exc}: {body[:800]}" if body else str(exc)
+    if isinstance(exc, anthropic.APIStatusError):
+        body = getattr(exc, "body", "") or ""
+        return f"{exc}: {body}"[:800]
+    return str(exc)
+
+
 def http_status_for(exc: Exception) -> int:
     """예외를 클라이언트에 돌려줄 HTTP 상태로 매핑 (기본 500). 원인을 그대로 노출."""
     if isinstance(exc, ProviderUnavailable):

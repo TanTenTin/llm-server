@@ -50,6 +50,10 @@ class GeminiProvider(LLMProvider):
         async with self.client.stream(
             "POST", "/chat/completions", json=payload
         ) as response:
+            # 스트리밍 응답은 본문을 자동으로 읽지 않으므로, 에러 시 사유가 비어버린다.
+            # 4xx/5xx면 본문을 먼저 당겨와 raise_for_status가 .text를 담은 채 던지게 한다.
+            if response.status_code >= 400:
+                await response.aread()
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if line.startswith("data: "):

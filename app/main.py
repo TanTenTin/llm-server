@@ -13,6 +13,7 @@ from app.service import (
     RouteTrace,
     aclose_quietly,
     chat_with_fallback,
+    error_detail,
     http_status_for,
     stream_with_fallback,
 )
@@ -118,5 +119,5 @@ async def chat_completions(
         body = await chat_with_fallback(request, decision, pool, trace)
         return JSONResponse(content=body, headers={"x-llm-route": trace.header()})
     except Exception as e:
-        # 업스트림/입력 오류의 원래 상태를 그대로 노출 (모두 500으로 뭉개지 않음)
-        raise HTTPException(status_code=http_status_for(e), detail=str(e))
+        # 업스트림/입력 오류의 원래 상태 + 본문(실제 사유)을 그대로 노출 (모두 500으로 뭉개지 않음)
+        raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
