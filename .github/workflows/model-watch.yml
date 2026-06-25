@@ -1,0 +1,62 @@
+name: model-watch
+
+# provider(Gemini 등) 모델 목록을 매일 조회해 게이트웨이 레지스트리와 비교하고,
+# 새 모델/사라진 모델이 있으면 GitHub 이슈로 알린다(코드는 자동 수정하지 않음 — 사람이 반영).
+on:
+  schedule:
+    - cron: "0 0 * * *" # 매일 00:00 UTC (09:00 KST)
+  workflow_dispatch: {} # 수동 실행 허용
+
+permissions:
+  issues: write # 드리프트 이슈 생성/수정/종료
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # app.registry 임포트에 필요한 최소 의존성만 설치 (fastapi/anthropic 불필요)
+      - name: 의존성 설치
+        run: pip install httpx pydantic
+
+      - name: 모델 드리프트 감지
+        id: check
+        env:
+          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
+        run: python scripts/check_models.py
+
+      # 드리프트 유무에 따라 단일 이슈를 동기화한다(매일 중복 이슈를 만들지 않음):
+      #   - 드리프트 O: 열린 드리프트 이슈가 있으면 본문 갱신, 없으면 생성
+      #   - 드리프트 X: 열린 드리프트 이슈가 있으면 자동 종료
+      - name: 드리프트 이슈 동기화
+        if: always() && steps.check.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HAS_DRIFT: ${{ steps.check.outputs.has_drift }}
+        run: |
+          set -euo pipefail
+          TITLE="🤖 모델 드리프트 감지: 게이트웨이 레지스트리 갱신 필요"
+          gh label create model-drift --color FBCA04 --description "모델 목록 드리프트" 2>/dev/null || true
+          NUM=$(gh issue list --state open --label model-drift --json number --jq '.[0].number // empty')
+          if [ "$HAS_DRIFT" = "true" ]; then
+            if [ -n "$NUM" ]; then
+              gh issue edit "$NUM" --body-file model-drift-report.md
+              echo "기존 이슈 #$NUM 본문 갱신"
+            else
+              gh issue create --title "$TITLE" --label model-drift --body-file model-drift-report.md
+              echo "신규 드리프트 이슈 생성"
+            fi
+          else
+            if [ -n "$NUM" ]; then
+              gh issue close "$NUM" --comment "✅ 현재 드리프트 없음 — 자동 종료(model-watch)."
+              echo "드리프트 해소 → 이슈 #$NUM 종료"
+            else
+              echo "드리프트 없음 / 열린 이슈 없음 — 변동 없음"
+            fi
+          fi
