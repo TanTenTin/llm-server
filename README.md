@@ -249,6 +249,16 @@ response = await client.chat.completions.create(
 - **관측성(`x-llm-route` 헤더)**: 응답 본문은 OpenAI 형식 그대로 두고, 실제 라우팅 결과는 `x-llm-route` 응답 헤더로 노출한다 — 예: `requested=gemini-2.5-flash; served=ollama:qwen3:14b; fallback=1`. silent fallback이 일어나도 *무엇이 실제로 응답했는지* 헤더/로그로 바로 확인할 수 있다(호출 측 코드 변경 불필요).
 - **모델 추가/별칭/fallback 변경은 `app/registry.py`의 `MODELS`·`ALIASES`만** 수정하면 된다(`/v1/models` 목록도 자동 반영).
 
+## 자동 모델 감시 (model-watch)
+
+`.github/workflows/model-watch.yml`가 **매일 09:00 KST**에 provider의 모델 목록 API를
+조회해 `app/registry.py`의 `MODELS`와 비교한다(릴리스 노트 스크래핑이 아니라 models API가 신뢰원).
+
+- **감지**: `new`(라이브엔 있는데 레지스트리에 없는 새 무료 모델 후보) / `removed`(레지스트리엔 있는데 라이브에서 사라진 deprecated 후보). preview·스냅샷 변형은 노이즈로 제외.
+- **알림**: 드리프트가 있으면 단일 GitHub 이슈(`model-drift` 라벨)를 생성/갱신하고, 해소되면 자동 종료한다(매일 중복 이슈 없음). **코드는 자동 수정하지 않는다** — 이슈의 제안 diff를 보고 사람이 `registry.py`를 반영한다.
+- **provider 추가**: `scripts/check_models.py`의 `ModelSource`를 상속한 클래스 1개 작성 + `build_sources()`에 등록하면 끝(현재 Gemini만 활성).
+- **필요 설정**: GitHub Secret `GOOGLE_AI_API_KEY`(models 목록 조회용, 읽기 전용). 이슈 생성은 기본 `GITHUB_TOKEN`으로 동작.
+
 ## 제약사항 / 알려진 한계
 
 - **게이트웨이 자체 인증 없음** — API 키 검증·레이트리밋이 없다. 외부에 노출한다면 reverse proxy 등에서 별도 보호 필요.
