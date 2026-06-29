@@ -36,7 +36,7 @@ app/
     ├── base.py       — LLMProvider ABC: chat(request, spec) / stream(request, spec) / aclose()
     ├── openai_payload.py — OpenAI 패스스루 payload 공용 빌더(build_openai_payload). Gemini·Ollama 공용
     ├── ollama.py     — Ollama의 OpenAI 호환 API로 프록시(+think는 네이티브 /api/chat 경로)
-    ├── gemini.py     — Gemini의 OpenAI 호환 엔드포인트로 프록시 (영속 httpx client, Bearer 인증)
+    ├── gemini.py     — Gemini의 OpenAI 호환 엔드포인트로 프록시 (영속 httpx client, Bearer 인증) + 네이티브 패스스루(generate_native/stream_native: 별도 native_client, x-goog-api-key 인증, /v1beta/models/{m}:generateContent)
     └── anthropic.py  — OpenAI ↔ Anthropic 포맷 변환 후 SDK 호출 (client 재사용)
 ```
 
@@ -44,7 +44,11 @@ app/
 
 > **네이티브 포맷 엔드포인트 = 순수 포맷 어댑터**: `/v1/messages`(Anthropic)·`:generateContent`(Gemini)는 입력을 `adapters/`에서 `ChatCompletionRequest`(내부표준)로 변환해 **기존 `route()`→`*_with_fallback()` 파이프라인을 그대로** 태운다. OpenAI 응답을 다시 네이티브 포맷으로 역변환할 뿐, `model` 필드는 보존되어 라우팅/폴백/회로차단기/`x-llm-route` 헤더가 OpenAI 엔드포인트와 동일하게 동작한다(예: `/v1/messages`로 `gemini-2.5-flash` 요청 → Gemini로 라우팅). `providers/anthropic.py`의 변환은 '내부표준→업스트림' 방향, `adapters/`는 '클라이언트 네이티브→내부표준'(반대 방향)이라 분리한다. Gemini 엔드포인트는 main.py의 `_run_native()`가 공통 실행 경로(비스트리밍 `to_response`/스트리밍 `to_stream` 콜백 주입), 인증은 `require_native_auth()`가 `Authorization: Bearer`/`x-api-key`(Anthropic)/`x-goog-api-key`·`?key=`(Gemini)를 모두 게이트웨이 토큰으로 검증.
 
-> **Anthropic 패스스루 fast-path (`/v1/messages` + `claude-*`)**: 후보가 Anthropic provider면 OpenAI 이중 변환을 건너뛰고 **클라이언트 Anthropic body를 그대로 SDK로** 보낸다(`AnthropicProvider.chat_native`/`stream_native`). `cache_control`·정확한 content 블록·멀티턴/스트리밍 `tool_use`가 손실 없이 보존된다(기존 OpenAI→Anthropic 변환의 tool_use 누락 한계를 이 경로에서 회피). 표준 외 top-level 필드는 `extra_body`로 전달(`_ANTHROPIC_PASSTHROUGH` 화이트리스트 밖). 구현은 fallback 루프를 **포맷 무관 제너릭**(`service.run_chat_fallback`/`run_stream_fallback`, 후보별 호출 방식을 `invoke`/`open_stream` 콜백으로 주입)으로 분리하고, `/v1/messages` 핸들러가 'Anthropic 후보→네이티브 패스스루 / 그 외→어댑터 경로'를 콜백 안에서 분기한다. `chat_with_fallback`/`stream_with_fallback`(OpenAI 경로)도 같은 제너릭 루프의 얇은 래퍼. **단, OpenAI 엔드포인트(`/v1/chat/completions`)로 `claude-*`를 부르면 패스스루가 아니라 `AnthropicProvider.chat`(OpenAI 변환)을 타므로 기존 tool_use 한계가 그대로 남는다.**
+> **네이티브 패스스루 fast-path (Anthropic·Gemini 공통)**: 네이티브 엔드포인트에서 라우팅된 후보가 '해당 네이티브 provider'면 OpenAI 이중 변환을 건너뛰고 **클라이언트 원본 body를 그대로 업스트림으로** 보낸다.
+> - `/v1/messages` + `claude-*` → `AnthropicProvider.chat_native`/`stream_native`: `cache_control`·정확한 content 블록·멀티턴/스트리밍 `tool_use` 보존(기존 OpenAI→Anthropic 변환의 tool_use 누락 한계를 회피). 표준 외 top-level 필드는 `extra_body`로 전달(`_ANTHROPIC_PASSTHROUGH` 밖).
+> - `:generateContent` + `gemini-*` → `GeminiProvider.generate_native`/`stream_native`: 별도 `native_client`(x-goog-api-key 인증)로 네이티브 `/v1beta/models/{m}:generateContent` 호출. `safetySettings`·`thinkingConfig`·`cachedContent` 등 Gemini 전용 필드와 네이티브 응답 구조 보존(OpenAI-compat이 못 싣는 필드).
+>
+> 구현은 fallback 루프를 **포맷 무관 제너릭**(`service.run_chat_fallback`/`run_stream_fallback`, 후보별 호출 방식을 `invoke`/`open_stream` 콜백으로 주입)으로 분리하고, main.py의 공통 헬퍼 `_run_native_passthrough(native_provider, native_chat, native_stream, to_response, to_stream)`가 '네이티브 후보→패스스루 / 그 외→어댑터 경로'를 콜백 안에서 분기한다(Anthropic·Gemini 핸들러가 이 헬퍼 공유). `chat_with_fallback`/`stream_with_fallback`(OpenAI 경로)도 같은 제너릭 루프의 얇은 래퍼. **단, OpenAI 엔드포인트(`/v1/chat/completions`)로 `claude-*`를 부르면 패스스루가 아니라 `AnthropicProvider.chat`(OpenAI 변환)을 타므로 기존 tool_use 한계가 그대로 남는다.**
 
 ## 요청 처리 흐름
 

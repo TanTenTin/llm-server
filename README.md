@@ -245,6 +245,10 @@ curl "http://localhost:8000/v1beta/models/claude-sonnet-4-6:generateContent?key=
 # ← 포맷은 Gemini, 라우팅은 Anthropic(claude)으로
 ```
 
+> **Gemini 패스스루 fast-path**: 라우팅된 후보가 **Gemini provider**면, 게이트웨이는 OpenAI-compat 변환을 거치지 않고 **클라이언트의 Gemini body를 네이티브 `generateContent` 엔드포인트로 그대로 보낸다**. 덕분에 `safetySettings`·`thinkingConfig`·`cachedContent`(컨텍스트 캐싱) 등 **Gemini 전용 필드**와 응답의 네이티브 구조(`candidates`/`usageMetadata`/`safetyRatings`)가 손실 없이 보존된다. 폴백 후보(예: 장애 시 Ollama)는 아래 어댑터 경로(OpenAI 변환 후 Gemini 응답으로 역변환)를 탄다.
+
+아래 변환은 **폴백 후보(비-Gemini provider)** 가 응답할 때 적용된다(Gemini 후보는 위 패스스루로 손실 없음):
+
 - **입력 변환**: `systemInstruction` → system 메시지, `contents`의 role `model`→`assistant`, `functionCall`↔`tool_calls`, `functionResponse` → OpenAI `tool` 메시지, `inlineData` → `image_url`, `generationConfig`(`temperature`/`maxOutputTokens`/`topP`/`topK`/`stopSequences`) 매핑, `toolConfig.functionCallingConfig`(`AUTO`/`ANY`/`NONE`) → `tool_choice`.
 - **응답 변환**: `candidates[].content.parts`(text/`functionCall`) + `finishReason`(`stop`→`STOP`, `length`→`MAX_TOKENS`) + `usageMetadata`.
 - **스트리밍**(`:streamGenerateContent`): Gemini SSE(`data: <GenerateContentResponse>`)로 변환한다. text 델타는 즉시 흘려보내고, tool 호출은 부분 `arguments`를 누적했다가 마지막 청크에서 완성된 `functionCall`로 내보낸다.

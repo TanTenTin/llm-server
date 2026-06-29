@@ -1,6 +1,6 @@
 import secrets
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Callable, Optional
+from typing import AsyncGenerator, Awaitable, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -187,28 +187,51 @@ async def chat_completions(
 
 
 # ─────────────────────────────────────────────────────────────
-# 네이티브 포맷 엔드포인트 — 입력/출력만 네이티브로 어댑팅, 라우팅은 동일 파이프라인 재사용
+# 네이티브 포맷 엔드포인트 — 네이티브 패스스루(fast-path) + 폴백 어댑터 경로
+#
+# 후보가 '해당 네이티브 provider'면 클라이언트 원본 body를 그대로 업스트림에 보내고(이중 변환
+# 없음 → provider 전용 필드·정확한 구조 보존), 그 외 후보(폴백 등)는 어댑터 경로(OpenAI 변환 후
+# 네이티브 포맷으로 역변환)를 탄다. 회로차단기·재시도·트레이스는 공통 fallback 루프가 동일 적용.
+# Anthropic·Gemini가 이 구조를 공유하므로, provider별 차이(네이티브 호출 메서드/출력 어댑터)만
+# 콜백으로 주입받는 제너릭 헬퍼로 묶는다.
 # ─────────────────────────────────────────────────────────────
-async def _run_native(
+async def _run_native_passthrough(
     request: ChatCompletionRequest,
+    body: dict,
+    native_provider: str,
+    native_chat: Callable[[object, dict, ModelSpec], Awaitable[dict]],
+    native_stream: Callable[[object, dict, ModelSpec], AsyncGenerator[str, None]],
     to_response: Callable[[dict], dict],
     to_stream: Callable[[AsyncGenerator[str, None]], AsyncGenerator[str, None]],
 ) -> JSONResponse | StreamingResponse:
     """
-    네이티브 엔드포인트 공통 실행 경로. 어댑터가 만든 ChatCompletionRequest를 기존 라우팅/폴백
-    파이프라인에 태우고, 결과(OpenAI 형식)를 출력 어댑터로 네이티브 포맷에 맞춰 돌려준다.
-    `to_response`: 비스트리밍 OpenAI dict → 네이티브 응답 dict.
-    `to_stream`:   OpenAI SSE 제너레이터 → 네이티브 SSE 제너레이터.
+    네이티브 엔드포인트 공통 실행 경로.
+    `native_provider`: 패스스루를 적용할 provider 이름("anthropic" | "gemini").
+    `native_chat`/`native_stream`: 그 provider의 네이티브 호출(원본 body 그대로 전달).
+    `to_response`/`to_stream`: 폴백(비-native provider) 결과(OpenAI)를 네이티브로 역변환.
     """
     pool: ProviderPool = app.state.pool
     decision = route(request)
     trace = RouteTrace(requested=request.model, reason=decision.reason)
+
+    async def invoke(spec: ModelSpec) -> dict:
+        provider = pool.get(spec.provider)  # ProviderUnavailable 가능 → 다음 후보로
+        if spec.provider == native_provider:
+            return await native_chat(provider, body, spec)   # 네이티브 패스스루
+        return to_response(await provider.chat(request, spec))  # 폴백: 어댑터 경로
+
+    def open_stream(spec: ModelSpec) -> AsyncGenerator[str, None]:
+        provider = pool.get(spec.provider)
+        if spec.provider == native_provider:
+            return native_stream(provider, body, spec)       # 네이티브 SSE 그대로
+        return to_stream(provider.stream(request, spec))     # 폴백: 어댑터 변환
+
     try:
         if request.stream:
-            inner = stream_with_fallback(request, decision, pool, trace)
-            return await _streaming_response(to_stream(inner), trace)
-        body = await chat_with_fallback(request, decision, pool, trace)
-        return JSONResponse(content=to_response(body), headers={"x-llm-route": trace.header()})
+            gen = run_stream_fallback(decision, pool, trace, open_stream)
+            return await _streaming_response(gen, trace)
+        body_out = await run_chat_fallback(decision, pool, trace, invoke)
+        return JSONResponse(content=body_out, headers={"x-llm-route": trace.header()})
     except Exception as e:
         raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
 
@@ -222,8 +245,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
 
     **Anthropic 패스스루 fast-path**: 후보가 Anthropic provider면 원본 Anthropic body를
     그대로 SDK로 보낸다(OpenAI 이중 변환 없음 → cache_control·멀티턴/스트리밍 tool_use 보존).
-    그 외 provider(폴백 등)는 어댑터 경로(OpenAI 변환 후 Anthropic 응답으로 역변환)를 탄다.
-    회로차단기·재시도·트레이스는 공통 fallback 루프가 동일하게 적용한다.
+    그 외 provider(폴백 등)는 어댑터 경로를 탄다.
     """
     require_native_auth(http_request)
     body = await http_request.json()
@@ -232,32 +254,16 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    pool: ProviderPool = app.state.pool
-    decision = route(request)
-    trace = RouteTrace(requested=request.model, reason=decision.reason)
     model = request.model
-
-    async def invoke(spec: ModelSpec) -> dict:
-        provider = pool.get(spec.provider)  # ProviderUnavailable 가능 → 다음 후보로
-        if spec.provider == "anthropic":
-            return await provider.chat_native(body, spec)  # 네이티브 패스스루
-        openai_resp = await provider.chat(request, spec)   # 폴백: 어댑터 경로
-        return openai_to_anthropic_response(openai_resp, model)
-
-    def open_stream(spec: ModelSpec) -> AsyncGenerator[str, None]:
-        provider = pool.get(spec.provider)
-        if spec.provider == "anthropic":
-            return provider.stream_native(body, spec)      # 네이티브 Anthropic SSE 그대로
-        return stream_openai_to_anthropic(provider.stream(request, spec), model)
-
-    try:
-        if request.stream:
-            gen = run_stream_fallback(decision, pool, trace, open_stream)
-            return await _streaming_response(gen, trace)
-        body_out = await run_chat_fallback(decision, pool, trace, invoke)
-        return JSONResponse(content=body_out, headers={"x-llm-route": trace.header()})
-    except Exception as e:
-        raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
+    return await _run_native_passthrough(
+        request,
+        body,
+        native_provider="anthropic",
+        native_chat=lambda provider, b, spec: provider.chat_native(b, spec),
+        native_stream=lambda provider, b, spec: provider.stream_native(b, spec),
+        to_response=lambda openai_body: openai_to_anthropic_response(openai_body, model),
+        to_stream=lambda inner: stream_openai_to_anthropic(inner, model),
+    )
 
 
 async def _gemini_generate(
@@ -267,6 +273,11 @@ async def _gemini_generate(
     Gemini generateContent / streamGenerateContent 공통 핸들러.
     경로 `{model}:{action}` 에서 모델과 액션을 분리한다(예: 'gemini-2.5-flash:generateContent').
     인증: GATEWAY_API_KEY 설정 시 `x-goog-api-key`/`?key=`/`Authorization: Bearer` 중 하나.
+
+    **Gemini 패스스루 fast-path**: 후보가 Gemini provider면 원본 Gemini body를 네이티브
+    generateContent 엔드포인트로 그대로 보낸다(OpenAI-compat 이중 변환 없음 → safetySettings·
+    thinkingConfig·cachedContent 등 Gemini 전용 필드와 네이티브 응답 구조 보존). 폴백 후보(예:
+    Ollama)는 어댑터 경로(OpenAI 변환 후 Gemini 응답으로 역변환)를 탄다.
     """
     require_native_auth(http_request)
     model, _, action = model_action.rpartition(":")
@@ -276,13 +287,18 @@ async def _gemini_generate(
     body = await http_request.json()
     stream = action == "streamGenerateContent"
     try:
-        request = gemini_to_chat_request(body, model, stream)
+        request = gemini_to_chat_request(body, model, stream)  # 라우팅 판단용 내부표준
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return await _run_native(
+
+    return await _run_native_passthrough(
         request,
-        lambda openai_body: openai_to_gemini_response(openai_body, model),
-        lambda inner: stream_openai_to_gemini(inner, model),
+        body,
+        native_provider="gemini",
+        native_chat=lambda provider, b, spec: provider.generate_native(b, spec),
+        native_stream=lambda provider, b, spec: provider.stream_native(b, spec),
+        to_response=lambda openai_body: openai_to_gemini_response(openai_body, model),
+        to_stream=lambda inner: stream_openai_to_gemini(inner, model),
     )
 
 
