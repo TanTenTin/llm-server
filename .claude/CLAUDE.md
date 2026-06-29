@@ -21,13 +21,17 @@
 
 ```
 app/
-├── main.py        — 엔드포인트 + lifespan(풀 생성/정리): POST /v1/chat/completions, GET /v1/models, GET /health, WS /v1/realtime
+├── main.py        — 엔드포인트 + lifespan(풀 생성/정리): POST /v1/chat/completions(OpenAI), POST /v1/messages(Anthropic 네이티브), POST /v1beta/models/{model}:generateContent·:streamGenerateContent(Gemini 네이티브), GET /v1/models, GET /health, WS /v1/realtime
 ├── config.py      — Settings (GOOGLE_AI_API_KEY, ANTHROPIC_API_KEY, OLLAMA_BASE_URL, GATEWAY_API_KEY, BREAKER_COOLDOWN_SECONDS, REALTIME_*)
-├── models.py      — ChatCompletionRequest 등 OpenAI 호환 Pydantic 모델
+├── models.py      — ChatCompletionRequest 등 OpenAI 호환 Pydantic 모델 (내부표준 canonical 포맷)
 ├── registry.py    — 라우팅 결정: ModelSpec(+cost_tier/is_free 메타) / RouteDecision / MODELS / ALIASES / DEFAULT_MODEL / resolve() / LIVE_ALIASES·resolve_live_model()
 ├── service.py     — ProviderPool(인스턴스 재사용) + CircuitBreaker + RouteTrace + fallback 실행 + 에러 분류
 ├── realtime.py    — /v1/realtime 음성 브리지: OpenAI Realtime 이벤트 ↔ Gemini Live(네이티브 WSS) 양방향 중계 (RealtimeBridge)
 ├── audio.py       — PCM16 리샘플러(resample_pcm16): 클라 입력 24kHz → Gemini 16kHz (순수 파이썬, 의존성 0)
+├── adapters/      — 네이티브 입력 포맷 어댑터 (edge에서 네이티브 ⇄ OpenAI 내부표준 변환만 담당, 라우팅은 기존 파이프라인 재사용)
+│   ├── anthropic_io.py — Anthropic Messages ⇄ OpenAI: anthropic_to_chat_request / openai_to_anthropic_response / stream_openai_to_anthropic
+│   ├── gemini_io.py    — Gemini generateContent ⇄ OpenAI: gemini_to_chat_request / openai_to_gemini_response / stream_openai_to_gemini
+│   └── sse.py          — 어댑터 공용 SSE 헬퍼(sse_payloads / format_event / format_data)
 └── providers/
     ├── base.py       — LLMProvider ABC: chat(request, spec) / stream(request, spec) / aclose()
     ├── openai_payload.py — OpenAI 패스스루 payload 공용 빌더(build_openai_payload). Gemini·Ollama 공용
@@ -37,6 +41,8 @@ app/
 ```
 
 > 과거의 `router.py`는 제거됨. 라우팅 결정은 `registry.resolve()`, provider 선택/실행은 `service.py`가 담당한다.
+
+> **네이티브 포맷 엔드포인트 = 순수 포맷 어댑터**: `/v1/messages`(Anthropic)·`:generateContent`(Gemini)는 입력을 `adapters/`에서 `ChatCompletionRequest`(내부표준)로 변환해 **기존 `route()`→`*_with_fallback()` 파이프라인을 그대로** 태운다. OpenAI 응답을 다시 네이티브 포맷으로 역변환할 뿐, `model` 필드는 보존되어 라우팅/폴백/회로차단기/`x-llm-route` 헤더가 OpenAI 엔드포인트와 동일하게 동작한다(예: `/v1/messages`로 `gemini-2.5-flash` 요청 → Gemini로 라우팅). `providers/anthropic.py`의 변환은 '내부표준→업스트림' 방향, `adapters/`는 '클라이언트 네이티브→내부표준'(반대 방향)이라 분리한다. main.py의 `_run_native()`가 공통 실행 경로(비스트리밍 `to_response`/스트리밍 `to_stream` 콜백 주입), 인증은 `require_native_auth()`가 `Authorization: Bearer`/`x-api-key`(Anthropic)/`x-goog-api-key`·`?key=`(Gemini)를 모두 게이트웨이 토큰으로 검증.
 
 ## 요청 처리 흐름
 

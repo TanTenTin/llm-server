@@ -4,6 +4,8 @@
 
 에이전트나 클라이언트는 이 서버 하나만 바라보면 되고, 뒤에서 어떤 모델을 쓰든 코드 변경 없이 **모델 이름만 바꿔** 전환할 수 있다.
 
+OpenAI 포맷뿐 아니라 **Anthropic Messages**(`POST /v1/messages`)·**Gemini generateContent**(`POST /v1beta/models/{model}:generateContent`) **네이티브 포맷 엔드포인트**도 제공한다. 각 SDK(anthropic·google-genai)를 `base_url`만 바꿔 그대로 붙일 수 있다. 네이티브 엔드포인트는 **순수 포맷 어댑터**라서, 입출력 포맷만 해당 네이티브로 맞출 뿐 `model` 필드는 그대로 라우팅을 결정한다 — 즉 `/v1/messages`로 `gemini-2.5-flash`를 요청하면 Anthropic 포맷으로 받아 Gemini로 라우팅·폴백된다.
+
 ## 지원 Provider
 
 | Provider | 모델 이름 형식 | 비고 |
@@ -104,6 +106,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 OpenAI SDK / 호환 클라이언트에서 `base_url`만 바꾸면 바로 사용 가능하다.
 
 > **인증**: `GATEWAY_API_KEY`가 설정돼 있으면 `/v1/*` 요청에 `Authorization: Bearer <키>` 헤더가 필요하다(미설정 시 개방). `/health`는 인증 없이 접근 가능.
+>
+> 네이티브 엔드포인트(`/v1/messages`·`generateContent`)는 각 SDK가 키를 싣는 방식을 그대로 받는다 — `Authorization: Bearer <키>` 외에 Anthropic SDK의 `x-api-key: <키>`, Gemini SDK의 `x-goog-api-key: <키>`/`?key=<키>` 도 게이트웨이 토큰으로 검증한다.
 
 ### Chat Completions
 
@@ -181,6 +185,67 @@ POST /v1/chat/completions
 ```
 
 > Anthropic 응답의 `finish_reason`은 OpenAI의 `"stop"`이 아니라 Anthropic 원본 `stop_reason`(`end_turn` · `tool_use` · `max_tokens` 등)을 그대로 반영한다. `tool_use`인 경우 `message.tool_calls` 배열이 채워진다.
+
+### 네이티브 포맷 엔드포인트 (Anthropic / Gemini)
+
+OpenAI 포맷 외에, 각 provider의 **네이티브 요청/응답 포맷**을 그대로 받는 엔드포인트를 제공한다. 내부적으로는 네이티브 요청을 OpenAI 표준으로 들여와(inbound 어댑터) 동일한 라우팅·폴백·회로차단기 파이프라인을 태우고, 결과를 다시 네이티브 포맷으로 돌려준다(outbound 어댑터). **`model` 필드는 보존**되므로 라우팅은 OpenAI 엔드포인트와 똑같이 동작한다(폴백·`x-llm-route` 헤더 동일 적용).
+
+```
+Anthropic SDK ─→ POST /v1/messages ──────────────────┐
+                                                      │  네이티브→OpenAI 변환
+google-genai ─→ POST .../{model}:generateContent ─────┤        ↓
+            └─→ POST .../{model}:streamGenerateContent ┘  route() → fallback (기존 파이프라인)
+                                                               ↓  OpenAI 응답
+                                              OpenAI→네이티브 역변환 후 응답
+```
+
+#### Anthropic Messages
+
+```
+POST /v1/messages
+```
+
+Anthropic Messages API 요청/응답 포맷. `anthropic` SDK / Claude Code 클라이언트를 `base_url`만 바꿔 붙일 수 있다.
+
+```python
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic(
+    base_url="http://localhost:8000",   # /v1/messages 는 SDK가 자동으로 붙임
+    api_key="<GATEWAY_API_KEY>",         # x-api-key 헤더로 전송 → 게이트웨이가 검증
+)
+msg = await client.messages.create(
+    model="gemini-2.5-flash",            # ← 포맷은 Anthropic, 라우팅은 Gemini로
+    max_tokens=256,
+    messages=[{"role": "user", "content": "안녕"}],
+)
+```
+
+- **입력 변환**: `system`(문자열/블록) → system 메시지, `tool_use`↔`tool_calls`, user의 `tool_result` 블록 → OpenAI `tool` 메시지, `image` 블록 → OpenAI `image_url`(data URL), `tool_choice`(`auto`/`any`/`tool`/`none`) 변환, `stop_sequences`→`stop`.
+- **응답 변환**: OpenAI `finish_reason` → Anthropic `stop_reason`(`stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`), `tool_calls` → `tool_use` 블록, `usage` → `input_tokens`/`output_tokens`.
+- **스트리밍**(`"stream": true`): Anthropic 네이티브 SSE 이벤트 시퀀스로 변환한다 — `message_start` → `content_block_start`/`content_block_delta`(`text_delta`·`tool_use`는 `input_json_delta`)/`content_block_stop` → `message_delta` → `message_stop`.
+
+#### Gemini generateContent
+
+```
+POST /v1beta/models/{model}:generateContent          # 비스트리밍
+POST /v1beta/models/{model}:streamGenerateContent     # 스트리밍(SSE)
+```
+
+Gemini `generateContent` API 요청/응답 포맷. `google-genai` SDK가 붙을 수 있다(`/v1/models/...` 경로도 동일하게 받는다). **모델은 URL 경로**에서 받는다.
+
+```bash
+curl "http://localhost:8000/v1beta/models/claude-sonnet-4-6:generateContent?key=$GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"안녕"}]}]}'
+# ← 포맷은 Gemini, 라우팅은 Anthropic(claude)으로
+```
+
+- **입력 변환**: `systemInstruction` → system 메시지, `contents`의 role `model`→`assistant`, `functionCall`↔`tool_calls`, `functionResponse` → OpenAI `tool` 메시지, `inlineData` → `image_url`, `generationConfig`(`temperature`/`maxOutputTokens`/`topP`/`topK`/`stopSequences`) 매핑, `toolConfig.functionCallingConfig`(`AUTO`/`ANY`/`NONE`) → `tool_choice`.
+- **응답 변환**: `candidates[].content.parts`(text/`functionCall`) + `finishReason`(`stop`→`STOP`, `length`→`MAX_TOKENS`) + `usageMetadata`.
+- **스트리밍**(`:streamGenerateContent`): Gemini SSE(`data: <GenerateContentResponse>`)로 변환한다. text 델타는 즉시 흘려보내고, tool 호출은 부분 `arguments`를 누적했다가 마지막 청크에서 완성된 `functionCall`로 내보낸다.
+
+> **네이티브 어댑터 한계(v1)**: ① Gemini `functionResponse`에는 호출 id가 없어 `functionCall`/`functionResponse`를 **이름 기반(`call_<name>`)으로 매칭**한다 — 같은 이름 도구를 한 턴에 여러 번 호출하면 충돌할 수 있다. ② Anthropic 스트리밍 tool_use 변환은 업스트림이 OpenAI 포맷(Gemini·Ollama)일 때 정상 동작하며, 백엔드가 Anthropic provider면 provider 자체의 스트리밍 tool_use 미지원 한계(아래 [제약사항](#제약사항--알려진-한계))를 그대로 따른다. ③ 에러 응답은 게이트웨이 공통 포맷(`{"detail": ...}`)으로, 각 SDK의 네이티브 에러 포맷과 다르다.
 
 ### 모델 목록
 
@@ -309,6 +374,10 @@ llm-server/
 │   ├── service.py        # ProviderPool(재사용) + fallback 실행
 │   ├── realtime.py       # /v1/realtime — OpenAI Realtime ↔ Gemini Live 음성 브리지
 │   ├── audio.py          # PCM16 리샘플러 (24k→16k, 순수 파이썬)
+│   ├── adapters/         # 네이티브 포맷 어댑터 (네이티브 요청 ⇄ OpenAI 내부표준)
+│   │   ├── anthropic_io.py   # Anthropic Messages ⇄ OpenAI (/v1/messages)
+│   │   ├── gemini_io.py      # Gemini generateContent ⇄ OpenAI (.../{model}:generateContent)
+│   │   └── sse.py            # 어댑터 공용 SSE 헬퍼
 │   └── providers/
 │       ├── base.py            # Provider 추상 클래스 (LLMProvider)
 │       ├── openai_payload.py  # OpenAI 패스스루 payload 공용 빌더
