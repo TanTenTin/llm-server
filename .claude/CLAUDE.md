@@ -42,7 +42,9 @@ app/
 
 > 과거의 `router.py`는 제거됨. 라우팅 결정은 `registry.resolve()`, provider 선택/실행은 `service.py`가 담당한다.
 
-> **네이티브 포맷 엔드포인트 = 순수 포맷 어댑터**: `/v1/messages`(Anthropic)·`:generateContent`(Gemini)는 입력을 `adapters/`에서 `ChatCompletionRequest`(내부표준)로 변환해 **기존 `route()`→`*_with_fallback()` 파이프라인을 그대로** 태운다. OpenAI 응답을 다시 네이티브 포맷으로 역변환할 뿐, `model` 필드는 보존되어 라우팅/폴백/회로차단기/`x-llm-route` 헤더가 OpenAI 엔드포인트와 동일하게 동작한다(예: `/v1/messages`로 `gemini-2.5-flash` 요청 → Gemini로 라우팅). `providers/anthropic.py`의 변환은 '내부표준→업스트림' 방향, `adapters/`는 '클라이언트 네이티브→내부표준'(반대 방향)이라 분리한다. main.py의 `_run_native()`가 공통 실행 경로(비스트리밍 `to_response`/스트리밍 `to_stream` 콜백 주입), 인증은 `require_native_auth()`가 `Authorization: Bearer`/`x-api-key`(Anthropic)/`x-goog-api-key`·`?key=`(Gemini)를 모두 게이트웨이 토큰으로 검증.
+> **네이티브 포맷 엔드포인트 = 순수 포맷 어댑터**: `/v1/messages`(Anthropic)·`:generateContent`(Gemini)는 입력을 `adapters/`에서 `ChatCompletionRequest`(내부표준)로 변환해 **기존 `route()`→`*_with_fallback()` 파이프라인을 그대로** 태운다. OpenAI 응답을 다시 네이티브 포맷으로 역변환할 뿐, `model` 필드는 보존되어 라우팅/폴백/회로차단기/`x-llm-route` 헤더가 OpenAI 엔드포인트와 동일하게 동작한다(예: `/v1/messages`로 `gemini-2.5-flash` 요청 → Gemini로 라우팅). `providers/anthropic.py`의 변환은 '내부표준→업스트림' 방향, `adapters/`는 '클라이언트 네이티브→내부표준'(반대 방향)이라 분리한다. Gemini 엔드포인트는 main.py의 `_run_native()`가 공통 실행 경로(비스트리밍 `to_response`/스트리밍 `to_stream` 콜백 주입), 인증은 `require_native_auth()`가 `Authorization: Bearer`/`x-api-key`(Anthropic)/`x-goog-api-key`·`?key=`(Gemini)를 모두 게이트웨이 토큰으로 검증.
+
+> **Anthropic 패스스루 fast-path (`/v1/messages` + `claude-*`)**: 후보가 Anthropic provider면 OpenAI 이중 변환을 건너뛰고 **클라이언트 Anthropic body를 그대로 SDK로** 보낸다(`AnthropicProvider.chat_native`/`stream_native`). `cache_control`·정확한 content 블록·멀티턴/스트리밍 `tool_use`가 손실 없이 보존된다(기존 OpenAI→Anthropic 변환의 tool_use 누락 한계를 이 경로에서 회피). 표준 외 top-level 필드는 `extra_body`로 전달(`_ANTHROPIC_PASSTHROUGH` 화이트리스트 밖). 구현은 fallback 루프를 **포맷 무관 제너릭**(`service.run_chat_fallback`/`run_stream_fallback`, 후보별 호출 방식을 `invoke`/`open_stream` 콜백으로 주입)으로 분리하고, `/v1/messages` 핸들러가 'Anthropic 후보→네이티브 패스스루 / 그 외→어댑터 경로'를 콜백 안에서 분기한다. `chat_with_fallback`/`stream_with_fallback`(OpenAI 경로)도 같은 제너릭 루프의 얇은 래퍼. **단, OpenAI 엔드포인트(`/v1/chat/completions`)로 `claude-*`를 부르면 패스스루가 아니라 `AnthropicProvider.chat`(OpenAI 변환)을 타므로 기존 tool_use 한계가 그대로 남는다.**
 
 ## 요청 처리 흐름
 
@@ -146,9 +148,11 @@ OpenAI와 Anthropic의 차이가 있어서 변환 로직이 들어있다. 수정
 
 ### 미구현 / 기존 한계 (라우팅과 별개, 추후 과제)
 
-- **assistant `tool_calls` → Anthropic `tool_use` 역변환 없음**: `models.py`의 `Message`에 `tool_calls` 필드가 없어, OpenAI 멀티턴 tool 대화를 Anthropic으로 보내면 직전 assistant의 `tool_use`가 누락 → Anthropic이 400으로 거부될 수 있음.
-- **Anthropic 스트리밍 시 `tool_use` 누락**: `stream()`이 `text_stream`만 처리 → 스트리밍 모드에서 함수 호출이 빠짐(비스트리밍 `chat()`은 정상).
-- **`finish_reason` 비변환**: Anthropic 원본 `stop_reason`(`end_turn`/`max_tokens` 등)을 그대로 노출 → OpenAI의 `stop`/`length`/`tool_calls`와 다름.
+> 아래 ①②는 **OpenAI→Anthropic 변환 경로(`AnthropicProvider.chat`/`stream`)에 한정**된다. 즉 `/v1/chat/completions`로 `claude-*`를 부르거나, `/v1/messages` 폴백이 Anthropic이 아닌 다른 후보에서 다시 Anthropic으로 갈 때만 해당. **`/v1/messages` + `claude-*`(주 경로)는 패스스루 fast-path(`chat_native`/`stream_native`)라 이 한계가 없다** — body를 그대로 SDK로 보내므로 멀티턴/스트리밍 `tool_use`가 보존됨.
+
+- **① assistant `tool_calls` → Anthropic `tool_use` 역변환 없음**: `AnthropicProvider._convert_messages`가 assistant의 `tool_calls`(속성)를 `tool_use` 블록으로 되돌리지 않아(content가 list일 때만 처리), OpenAI 멀티턴 tool 대화를 Anthropic 변환 경로로 보내면 직전 `tool_use`가 누락 → 400 가능.
+- **② Anthropic 변환 경로 스트리밍 시 `tool_use` 누락**: `AnthropicProvider.stream()`이 `text_stream`만 처리 → 스트리밍 모드에서 함수 호출이 빠짐(비스트리밍 `chat()`은 정상).
+- **③ `finish_reason` 비변환**: Anthropic 원본 `stop_reason`(`end_turn`/`max_tokens` 등)을 그대로 노출 → OpenAI의 `stop`/`length`/`tool_calls`와 다름. (네이티브 `/v1/messages`는 애초에 Anthropic 포맷이라 무관.)
 
 ## 새 Provider 추가 절차
 

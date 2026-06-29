@@ -11,6 +11,14 @@ from app.registry import ModelSpec
 # 요청·레지스트리 모두 max_tokens가 없을 때 쓰는 최후 기본값
 DEFAULT_MAX_TOKENS = 8192
 
+# 네이티브 패스스루(/v1/messages → Anthropic)에서 SDK 호출 인자로 '그대로' 넘길 표준 파라미터.
+# SDK 버전마다 지원 kwargs가 달라질 수 있어, 이 목록 밖의 top-level 필드(예: thinking, beta 옵션)는
+# extra_body 로 보내 JSON 본문에 그대로 병합한다(미지 kwargs로 인한 TypeError 회피).
+_ANTHROPIC_PASSTHROUGH = {
+    "messages", "system", "max_tokens", "metadata", "stop_sequences",
+    "temperature", "top_p", "top_k", "tools", "tool_choice",
+}
+
 
 class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str):
@@ -146,6 +154,47 @@ class AnthropicProvider(LLMProvider):
         if request.tools:
             params["tools"] = self._convert_tools(request.tools)
         return params
+
+    # ── 네이티브 패스스루 (/v1/messages → Anthropic) ──────────────
+    # OpenAI 내부표준을 거치지 않고 클라이언트의 Anthropic 요청을 그대로 SDK로 보낸다.
+    # 이중 변환(Anthropic→OpenAI→Anthropic)을 없애 cache_control·정확한 content 블록·
+    # 멀티턴 tool_use·스트리밍 tool_use(input_json_delta)가 손실 없이 보존된다.
+    def _native_params(self, body: dict, spec: ModelSpec) -> dict:
+        """
+        클라이언트 Anthropic Messages body → SDK 호출 인자. model은 레지스트리 spec.upstream으로
+        보정하고, max_tokens가 없으면 spec/기본값으로 채운다. 표준 외 top-level 필드는 extra_body로.
+        """
+        known: dict = {}
+        extra: dict = {}
+        for key, value in body.items():
+            if key in ("model", "stream"):
+                continue  # model은 레지스트리가 결정, stream은 호출 측에서 별도 지정
+            (known if key in _ANTHROPIC_PASSTHROUGH else extra)[key] = value
+        known["model"] = spec.upstream
+        known.setdefault("max_tokens", spec.max_tokens or DEFAULT_MAX_TOKENS)
+        if extra:
+            known["extra_body"] = extra
+        return known
+
+    async def chat_native(self, body: dict, spec: ModelSpec) -> dict:
+        """Anthropic 네이티브 패스스루(비스트리밍). 응답도 Anthropic Messages 포맷 dict 그대로 반환."""
+        params = self._native_params(body, spec)
+        response = await self.client.messages.create(**params)
+        return response.model_dump()
+
+    async def stream_native(
+        self, body: dict, spec: ModelSpec
+    ) -> AsyncGenerator[str, None]:
+        """
+        Anthropic 네이티브 패스스루(스트리밍). SDK 원본 raw 이벤트를 Anthropic 와이어 SSE로
+        그대로 중계한다(`event: <type>\\ndata: <json>\\n\\n`). 변환을 거치지 않아 tool_use
+        스트리밍이 누락되지 않는다(기존 OpenAI 변환 경로의 한계 회피).
+        """
+        params = self._native_params(body, spec)
+        params["stream"] = True
+        stream = await self.client.messages.create(**params)
+        async for event in stream:
+            yield f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
 
     async def chat(self, request: ChatCompletionRequest, spec: ModelSpec) -> dict:
         params = self._build_params(request, spec)

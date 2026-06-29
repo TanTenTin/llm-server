@@ -221,6 +221,10 @@ msg = await client.messages.create(
 )
 ```
 
+> **Anthropic 패스스루 fast-path**: 라우팅된 후보가 **Anthropic provider**(`claude-*`)면, 게이트웨이는 OpenAI 내부표준을 거치지 않고 **클라이언트의 Anthropic body를 그대로 SDK로 보낸다**(이중 변환 회피). 덕분에 `cache_control`(프롬프트 캐싱)·정확한 content 블록·**멀티턴 및 스트리밍 `tool_use`가 손실 없이 보존**된다 — Claude Code처럼 도구를 많이 쓰는 에이전트를 `claude-*`로 붙일 때 핵심. 표준 외 top-level 필드(예: `thinking`·beta 옵션)는 `extra_body`로 그대로 전달한다. 폴백 후보(예: 장애 시 Ollama)는 아래 어댑터 경로(OpenAI 변환 후 Anthropic 응답으로 역변환)를 타며, 회로차단기·재시도·`x-llm-route`는 동일하게 적용된다.
+
+아래 변환은 **폴백 후보(비-Anthropic provider)** 가 응답할 때 적용된다(Anthropic 후보는 위 패스스루로 손실 없음):
+
 - **입력 변환**: `system`(문자열/블록) → system 메시지, `tool_use`↔`tool_calls`, user의 `tool_result` 블록 → OpenAI `tool` 메시지, `image` 블록 → OpenAI `image_url`(data URL), `tool_choice`(`auto`/`any`/`tool`/`none`) 변환, `stop_sequences`→`stop`.
 - **응답 변환**: OpenAI `finish_reason` → Anthropic `stop_reason`(`stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`), `tool_calls` → `tool_use` 블록, `usage` → `input_tokens`/`output_tokens`.
 - **스트리밍**(`"stream": true`): Anthropic 네이티브 SSE 이벤트 시퀀스로 변환한다 — `message_start` → `content_block_start`/`content_block_delta`(`text_delta`·`tool_use`는 `input_json_delta`)/`content_block_stop` → `message_delta` → `message_stop`.
@@ -245,7 +249,7 @@ curl "http://localhost:8000/v1beta/models/claude-sonnet-4-6:generateContent?key=
 - **응답 변환**: `candidates[].content.parts`(text/`functionCall`) + `finishReason`(`stop`→`STOP`, `length`→`MAX_TOKENS`) + `usageMetadata`.
 - **스트리밍**(`:streamGenerateContent`): Gemini SSE(`data: <GenerateContentResponse>`)로 변환한다. text 델타는 즉시 흘려보내고, tool 호출은 부분 `arguments`를 누적했다가 마지막 청크에서 완성된 `functionCall`로 내보낸다.
 
-> **네이티브 어댑터 한계(v1)**: ① Gemini `functionResponse`에는 호출 id가 없어 `functionCall`/`functionResponse`를 **이름 기반(`call_<name>`)으로 매칭**한다 — 같은 이름 도구를 한 턴에 여러 번 호출하면 충돌할 수 있다. ② Anthropic 스트리밍 tool_use 변환은 업스트림이 OpenAI 포맷(Gemini·Ollama)일 때 정상 동작하며, 백엔드가 Anthropic provider면 provider 자체의 스트리밍 tool_use 미지원 한계(아래 [제약사항](#제약사항--알려진-한계))를 그대로 따른다. ③ 에러 응답은 게이트웨이 공통 포맷(`{"detail": ...}`)으로, 각 SDK의 네이티브 에러 포맷과 다르다.
+> **네이티브 어댑터 한계(v1)**: ① Gemini `functionResponse`에는 호출 id가 없어 `functionCall`/`functionResponse`를 **이름 기반(`call_<name>`)으로 매칭**한다 — 같은 이름 도구를 한 턴에 여러 번 호출하면 충돌할 수 있다. ② `/v1/messages`의 Anthropic 후보는 패스스루 fast-path라 스트리밍 tool_use가 정상 보존되지만, **OpenAI 엔드포인트(`/v1/chat/completions`)로 `claude-*`를 호출할 때**는 여전히 provider의 스트리밍 tool_use 미지원 한계(아래 [제약사항](#제약사항--알려진-한계))를 따른다. ③ 에러 응답은 게이트웨이 공통 포맷(`{"detail": ...}`)으로, 각 SDK의 네이티브 에러 포맷과 다르다.
 
 ### 모델 목록
 
@@ -360,7 +364,7 @@ response = await client.chat.completions.create(
 - **스트리밍 fallback은 첫 토큰 전까지만** — 토큰이 나가기 시작한 뒤 업스트림이 끊기면 스트림이 중단된다(복구 불가).
 - **`tool_choice`는 OpenAI 패스스루(Gemini·Ollama)로 전달** — Anthropic provider는 여전히 `tool_choice`를 변환/전달하지 않는다.
 - **OpenAI 패스스루는 미지 필드를 보존한다** — 요청/메시지 모델이 `extra="allow"`라, 게이트웨이가 모르는 메시지 구조 필드(예: `tool_calls`)도 버리지 않고 그대로 업스트림에 전달한다. 요청 레벨 파라미터는 `app/providers/openai_payload.py`의 화이트리스트(`temperature`·`top_p`·`stop`·`response_format`·`tool_choice` 등)로 전달하며, 미지의 요청 레벨 필드는 엄격한 업스트림의 400을 피하려 전달하지 않는다(메시지는 보존, 요청 파라미터는 선별).
-- **Anthropic 멀티턴 tool / 스트리밍 tool_use 미지원** — assistant `tool_calls`를 Anthropic `tool_use`로 역변환하지 않아 tool 왕복 대화가 깨질 수 있고, 스트리밍 시 함수 호출이 누락된다. `finish_reason`도 Anthropic 원본 값(`end_turn` 등)을 그대로 노출한다.
+- **Anthropic 멀티턴 tool / 스트리밍 tool_use 미지원 (OpenAI 엔드포인트 한정)** — `/v1/chat/completions`로 `claude-*`를 호출하면 `AnthropicProvider`가 OpenAI→Anthropic 변환을 하는데, assistant `tool_calls`를 Anthropic `tool_use`로 역변환하지 않아 tool 왕복 대화가 깨질 수 있고 스트리밍 시 함수 호출이 누락된다. **`/v1/messages`(네이티브 엔드포인트)로 `claude-*`를 호출하면 패스스루 fast-path가 이 변환 자체를 건너뛰어 정상 동작한다** — Claude Code 등 Anthropic SDK 클라이언트는 이 경로를 쓰면 된다.
 
 ## 프로젝트 구조
 

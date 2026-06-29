@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 import anthropic
 import httpx
@@ -204,14 +204,25 @@ async def aclose_quietly(gen: AsyncGenerator[str, None]) -> None:
 
 # ─────────────────────────────────────────────────────────────
 # Fallback 실행
+#
+# 후보 체인 순회·회로차단기·재시도·트레이스 같은 '라우팅 메커니즘'은 포맷과 무관하다.
+# 그래서 제너릭 루프(run_chat_fallback / run_stream_fallback)로 분리하고, "각 후보를 실제로
+# 어떻게 호출해 결과를 만들지"만 콜백(invoke / open_stream)으로 주입한다.
+#   - OpenAI 엔드포인트: provider.chat/stream 을 그대로 호출(결과는 OpenAI 포맷)
+#   - 네이티브 엔드포인트(/v1/messages 등): Anthropic 후보는 네이티브 패스스루, 그 외는
+#     OpenAI 호출 후 네이티브 포맷으로 역변환 — 둘 다 '이미 응답 포맷으로 완성된' 결과를 돌려준다.
 # ─────────────────────────────────────────────────────────────
-async def chat_with_fallback(
-    request: ChatCompletionRequest,
+async def run_chat_fallback(
     decision: RouteDecision,
     pool: ProviderPool,
-    trace: RouteTrace | None = None,
+    trace: RouteTrace | None,
+    invoke: Callable[[ModelSpec], Awaitable[dict]],
 ) -> dict:
-    """체인을 순서대로 시도. 미설정 provider/재시도 가능 에러면 다음 후보로."""
+    """
+    비스트리밍 fallback 공통 루프. 각 후보 spec마다 `invoke(spec)`을 호출해 결과(이미 응답
+    포맷으로 완성된 dict)를 받는다. provider 선택·결과 변환의 구체 방식은 invoke에 위임한다.
+    미설정 provider(`ProviderUnavailable`)/재시도 가능 에러면 다음 후보로 넘어간다.
+    """
     breaker = pool.breaker
     ordered, deferred = _order_by_breaker(decision.chain, breaker)
     if trace is not None:
@@ -223,8 +234,7 @@ async def chat_with_fallback(
     for idx, spec in enumerate(ordered):
         label = _spec_label(spec)
         try:
-            provider = pool.get(spec.provider)
-            result = await provider.chat(request, spec)
+            result = await invoke(spec)
         except ProviderUnavailable as e:
             last_exc = e  # 미설정 provider → 다음 후보로 (회로차단 대상 아님: 영구 설정 문제)
             if trace is not None:
@@ -245,21 +255,22 @@ async def chat_with_fallback(
             trace.served = label
             trace.fell_back = idx > 0 or bool(deferred)
             trace.attempts.append(f"{label}#ok")
-        logger.info("[route] 요청=%s → 응답=%s (fallback=%s)", request.model, label, idx > 0 or bool(deferred))
+        logger.info("[route] 응답=%s (fallback=%s)", label, idx > 0 or bool(deferred))
         return result
     raise last_exc if last_exc is not None else RuntimeError("라우팅 후보가 없습니다")
 
 
-async def stream_with_fallback(
-    request: ChatCompletionRequest,
+async def run_stream_fallback(
     decision: RouteDecision,
     pool: ProviderPool,
-    trace: RouteTrace | None = None,
+    trace: RouteTrace | None,
+    open_stream: Callable[[ModelSpec], AsyncGenerator[str, None]],
 ) -> AsyncGenerator[str, None]:
     """
-    스트리밍 fallback — 첫 청크를 받기 전에 실패한 후보만 건너뛴다.
-    한 번 토큰을 내보낸 뒤에는(이미 바이트를 전송했으므로) fallback 불가하며,
-    어떤 경로로 끝나든 업스트림 제너레이터를 반드시 정리한다(커넥션 누수 방지).
+    스트리밍 fallback 공통 루프 — 첫 청크를 받기 전에 실패한 후보만 건너뛴다.
+    `open_stream(spec)`은 해당 후보의 출력 스트림(이미 응답 포맷으로 완성된 SSE 제너레이터)을
+    돌려준다(미설정 provider면 호출 시점에 `ProviderUnavailable` 발생). 한 번 토큰을 내보낸
+    뒤에는 fallback 불가하며, 어떤 경로로 끝나든 업스트림 제너레이터를 반드시 정리한다.
     """
     breaker = pool.breaker
     ordered, deferred = _order_by_breaker(decision.chain, breaker)
@@ -272,14 +283,13 @@ async def stream_with_fallback(
     for idx, spec in enumerate(ordered):
         label = _spec_label(spec)
         try:
-            provider = pool.get(spec.provider)
+            gen = open_stream(spec)  # pool.get 등에서 ProviderUnavailable 가능
         except ProviderUnavailable as e:
             last_exc = e
             if trace is not None:
                 trace.attempts.append(f"{label}#unavailable")
             continue
 
-        gen = provider.stream(request, spec)
         try:
             # 첫 청크를 당겨본다. 여기서 나는 에러는 아직 아무것도 보내기 전이라
             # fallback(또는 상위에서 HTTP 상태 변환)이 가능하다.
@@ -309,7 +319,7 @@ async def stream_with_fallback(
             trace.served = label
             trace.fell_back = idx > 0 or bool(deferred)
             trace.attempts.append(f"{label}#ok")
-        logger.info("[route] 요청=%s → 스트림=%s (fallback=%s)", request.model, label, idx > 0 or bool(deferred))
+        logger.info("[route] 스트림=%s (fallback=%s)", label, idx > 0 or bool(deferred))
         try:
             yield first
             async for chunk in gen:
@@ -319,3 +329,28 @@ async def stream_with_fallback(
         return
 
     raise last_exc if last_exc is not None else RuntimeError("라우팅 후보가 없습니다")
+
+
+async def chat_with_fallback(
+    request: ChatCompletionRequest,
+    decision: RouteDecision,
+    pool: ProviderPool,
+    trace: RouteTrace | None = None,
+) -> dict:
+    """OpenAI 경로: 각 후보를 provider.chat(request, spec)로 호출(결과는 OpenAI 포맷)."""
+    async def invoke(spec: ModelSpec) -> dict:
+        return await pool.get(spec.provider).chat(request, spec)
+    return await run_chat_fallback(decision, pool, trace, invoke)
+
+
+async def stream_with_fallback(
+    request: ChatCompletionRequest,
+    decision: RouteDecision,
+    pool: ProviderPool,
+    trace: RouteTrace | None = None,
+) -> AsyncGenerator[str, None]:
+    """OpenAI 경로 스트리밍: 각 후보를 provider.stream(request, spec)로 호출."""
+    def open_stream(spec: ModelSpec) -> AsyncGenerator[str, None]:
+        return pool.get(spec.provider).stream(request, spec)
+    async for chunk in run_stream_fallback(decision, pool, trace, open_stream):
+        yield chunk

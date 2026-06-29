@@ -16,7 +16,7 @@ from app.adapters import (
 from app.config import settings
 from app.models import ChatCompletionRequest
 from app.realtime import RealtimeBridge
-from app.registry import AUTO_ROUTE, MODELS, RouteDecision, route
+from app.registry import AUTO_ROUTE, MODELS, ModelSpec, RouteDecision, route
 from app.service import (
     ProviderPool,
     RouteTrace,
@@ -24,6 +24,8 @@ from app.service import (
     chat_with_fallback,
     error_detail,
     http_status_for,
+    run_chat_fallback,
+    run_stream_fallback,
     stream_with_fallback,
 )
 
@@ -217,19 +219,45 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
     Anthropic Messages API 호환 엔드포인트. 요청/응답은 Anthropic 포맷이지만 model 필드가
     라우팅을 결정하므로 Gemini·Ollama로도 라우팅/폴백된다(순수 포맷 어댑터).
     인증: GATEWAY_API_KEY 설정 시 `x-api-key` 또는 `Authorization: Bearer` 필요.
+
+    **Anthropic 패스스루 fast-path**: 후보가 Anthropic provider면 원본 Anthropic body를
+    그대로 SDK로 보낸다(OpenAI 이중 변환 없음 → cache_control·멀티턴/스트리밍 tool_use 보존).
+    그 외 provider(폴백 등)는 어댑터 경로(OpenAI 변환 후 Anthropic 응답으로 역변환)를 탄다.
+    회로차단기·재시도·트레이스는 공통 fallback 루프가 동일하게 적용한다.
     """
     require_native_auth(http_request)
     body = await http_request.json()
     try:
-        request = anthropic_to_chat_request(body)
+        request = anthropic_to_chat_request(body)  # 라우팅 판단용 내부표준(폴백 후보가 사용)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    pool: ProviderPool = app.state.pool
+    decision = route(request)
+    trace = RouteTrace(requested=request.model, reason=decision.reason)
     model = request.model
-    return await _run_native(
-        request,
-        lambda openai_body: openai_to_anthropic_response(openai_body, model),
-        lambda inner: stream_openai_to_anthropic(inner, model),
-    )
+
+    async def invoke(spec: ModelSpec) -> dict:
+        provider = pool.get(spec.provider)  # ProviderUnavailable 가능 → 다음 후보로
+        if spec.provider == "anthropic":
+            return await provider.chat_native(body, spec)  # 네이티브 패스스루
+        openai_resp = await provider.chat(request, spec)   # 폴백: 어댑터 경로
+        return openai_to_anthropic_response(openai_resp, model)
+
+    def open_stream(spec: ModelSpec) -> AsyncGenerator[str, None]:
+        provider = pool.get(spec.provider)
+        if spec.provider == "anthropic":
+            return provider.stream_native(body, spec)      # 네이티브 Anthropic SSE 그대로
+        return stream_openai_to_anthropic(provider.stream(request, spec), model)
+
+    try:
+        if request.stream:
+            gen = run_stream_fallback(decision, pool, trace, open_stream)
+            return await _streaming_response(gen, trace)
+        body_out = await run_chat_fallback(decision, pool, trace, invoke)
+        return JSONResponse(content=body_out, headers={"x-llm-route": trace.header()})
+    except Exception as e:
+        raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
 
 
 async def _gemini_generate(
