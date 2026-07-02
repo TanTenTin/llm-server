@@ -103,7 +103,7 @@ LIVE_ALIASES: dict[str, str] = {
     "gemini-live": "gemini-2.5-flash-native-audio-preview-09-2025",
 }
 
-# ── auto 라우트 (Phase 2~3) ─────────────────────────────────
+# ── auto 라우트 (Phase 2~4) ─────────────────────────────────
 # 클라이언트가 model="auto"로 보내면, 게이트웨이가 직접 모델을 고른다.
 # 후보는 '무료'만, 비용·품질 우선순위 순으로 둔다(free-cloud Gemini → 로컬 Ollama).
 # 과금(Claude)은 auto에서 자동 선택하지 않는다 — 비용 0 보장. Claude가 필요하면 명시 지정.
@@ -111,15 +111,27 @@ LIVE_ALIASES: dict[str, str] = {
 # Phase 3: 요청 난이도(simple/complex)를 먼저 판단해 티어별로 후보 셋을 다르게 쓴다.
 #   simple  → 가볍고 빠른 모델(flash-lite, 14b)   : 인사·단순 질의·짧은 대화
 #   complex → 강한 모델(flash, 로컬은 14b)        : 도구 사용·긴 입력·다중턴·추론성 키워드
+# Phase 4: 대용량 컨텍스트 전용 'long' 티어. 추정 입력이 로컬 usable 창을 넘으면
+#   난이도와 무관하게 1M 컨텍스트 Gemini로 직행한다(로컬 32k는 어차피 필터에서 탈락).
 AUTO_ROUTE = "auto"
 AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
     "simple": ["gemini-2.5-flash-lite", "ollama/qwen3:14b"],
     "complex": ["gemini-2.5-flash", "ollama/qwen3:14b"],
+    "long": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
 }
 
 # 토큰 추정 계수: char 수 → 대략의 토큰 수(한글/혼합 보수적으로 3 chars/token 가정).
 # 정확한 토큰화가 아니라 "32k 로컬에 들어가나, 1M 클라우드가 필요한가" 판단용 근사치.
 _CHARS_PER_TOKEN = 3
+
+# 컨텍스트 안전 마진 (Phase 4): context_window의 이 비율까지만 '들어간다'고 본다.
+# _estimate_tokens 가 근사치(과소추정 가능)인 데다, 로컬 모델은 입력·출력이
+# 한 창(num_ctx)을 나눠 쓰므로 창을 꽉 채워 보내면 실제로는 잘리거나 실패한다.
+_CONTEXT_SAFETY_RATIO = 0.8
+
+# long 티어 임계값 (Phase 4): 추정 입력 토큰이 이 값 이상이면 난이도와 무관하게 'long'.
+# 로컬(32k)의 usable 창(32,000 × 0.8 = 25,600)을 넘보는 크기 = 대용량 컨텍스트 전용 라우팅.
+_LONG_INPUT_THRESHOLD = 25_000
 
 # 난이도 분류 임계값 — 아래 중 하나라도 걸리면 complex로 본다.
 _COMPLEX_TOKEN_THRESHOLD = 1200        # 추정 입력 토큰 (긴 입력 = 복잡)
@@ -205,11 +217,11 @@ def resolve(model: str) -> RouteDecision:
 
 
 # ─────────────────────────────────────────────────────────────
-# auto 라우팅 (Phase 2) — 요청 특성으로 모델을 직접 선택
+# auto 라우팅 (Phase 2~4) — 요청 특성으로 모델을 직접 선택
 # ─────────────────────────────────────────────────────────────
 def _estimate_tokens(request: ChatCompletionRequest) -> int:
     """
-    요청 입력 크기를 토큰 단위로 근사한다(메시지 + 도구 정의).
+    요청 입력 크기를 토큰 단위로 근사한다(메시지 + 도구 호출 이력 + 도구 정의).
     문자열 content는 길이, 비-문자열(멀티모달 등)은 JSON 직렬화 길이로 센 뒤
     _CHARS_PER_TOKEN으로 나눈다. context_window 적합성 판단용 근사치일 뿐
     정확한 토큰화가 아니다.
@@ -219,26 +231,41 @@ def _estimate_tokens(request: ChatCompletionRequest) -> int:
         content = message.content
         if isinstance(content, str):
             chars += len(content)
-        else:
+        elif content is not None:
             chars += len(json.dumps(content, ensure_ascii=False))
+        # 멀티턴 도구 왕복의 tool_calls(함수 인자)도 입력 컨텍스트를 차지한다 —
+        # 에이전트 대화에선 인자가 파일 내용 등으로 커질 수 있어 빼면 과소추정된다.
+        if message.tool_calls:
+            chars += len(json.dumps(message.tool_calls, ensure_ascii=False, default=str))
     if request.tools:
         chars += len(json.dumps([t.model_dump() for t in request.tools], ensure_ascii=False))
     return chars // _CHARS_PER_TOKEN
 
 
-def _classify_complexity(request: ChatCompletionRequest) -> str:
+def _usable_context(spec: ModelSpec) -> int:
+    """안전 마진(_CONTEXT_SAFETY_RATIO)을 반영한 실효 컨텍스트 크기(토큰)."""
+    return int(spec.context_window * _CONTEXT_SAFETY_RATIO)
+
+
+def _classify_tier(request: ChatCompletionRequest, estimated_tokens: int) -> str:
     """
-    요청 난이도를 'simple' | 'complex'로 분류한다(추가 LLM 호출 없는 휴리스틱).
-    아래 중 하나라도 걸리면 complex:
-      - 도구(tools) 사용 (function calling 오케스트레이션은 강한 모델이 유리)
-      - 추정 입력 토큰 ≥ _COMPLEX_TOKEN_THRESHOLD (긴 입력)
-      - 메시지 수 ≥ _COMPLEX_MESSAGE_COUNT (긴 멀티턴)
-      - 사용자 메시지에 추론/생성 부담 키워드 포함
-    그 외(짧은 단발 질의·인사 등)는 simple.
+    요청 티어를 'long' | 'complex' | 'simple'로 분류한다(추가 LLM 호출 없는 휴리스틱).
+
+    long이 난이도보다 우선한다 — 아무리 단순한 요청이라도 입력이 로컬 창을 넘으면
+    큰 컨텍스트 모델로 보내는 것 외에 선택지가 없다.
+      - long: 추정 입력 토큰 ≥ _LONG_INPUT_THRESHOLD (로컬 usable 창 초과 크기)
+      - complex: 아래 중 하나라도 해당
+          · 도구(tools) 사용 (function calling 오케스트레이션은 강한 모델이 유리)
+          · 추정 입력 토큰 ≥ _COMPLEX_TOKEN_THRESHOLD (긴 입력)
+          · 메시지 수 ≥ _COMPLEX_MESSAGE_COUNT (긴 멀티턴)
+          · 사용자 메시지에 추론/생성 부담 키워드 포함
+      - simple: 그 외 (짧은 단발 질의·인사 등)
     """
+    if estimated_tokens >= _LONG_INPUT_THRESHOLD:
+        return "long"
     if request.tools:
         return "complex"
-    if _estimate_tokens(request) >= _COMPLEX_TOKEN_THRESHOLD:
+    if estimated_tokens >= _COMPLEX_TOKEN_THRESHOLD:
         return "complex"
     if len(request.messages) >= _COMPLEX_MESSAGE_COUNT:
         return "complex"
@@ -253,29 +280,40 @@ def _classify_complexity(request: ChatCompletionRequest) -> str:
 
 def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
     """
-    model="auto" 처리. 먼저 난이도(simple/complex)를 판단해 티어별 후보 셋을 고르고,
-    그 후보를 요청 특성으로 필터링한다.
-      - 도구를 쓰는 요청인데 도구 미지원 모델 → 제외
-      - 추정 입력 토큰이 context_window를 초과하는 모델 → 제외
-    살아남은 후보를 비용·품질 우선순위(정의된 순서) 그대로 체인으로 만든다.
-    모두 탈락하면(예: 입력이 모든 무료 후보의 컨텍스트를 초과) DEFAULT_MODEL로 폴백한다.
+    model="auto" 처리 (Phase 2~4).
+      1. 입력 크기를 1회 추정하고 티어(simple/complex/long)에 맞는 후보 셋을 고른다
+      2. 후보를 요청 특성으로 필터링한다
+         - 도구를 쓰는 요청인데 도구 미지원 모델 → 제외
+         - '추정 입력 + 요청 출력(max_tokens)'이 usable 컨텍스트(안전 마진 반영)를
+           초과하는 모델 → 제외 (로컬은 입력·출력이 한 창을 나눠 쓰므로 출력분 포함)
+      3. 살아남은 후보를 비용·품질 우선순위(정의된 순서) 그대로 체인으로 만든다
+      4. 컨텍스트 초과로 전원 탈락하면 후보 중 창이 가장 큰 모델을 best-effort로
+         1개 시도한다 — DEFAULT_MODEL 무조건 폴백은 이미 탈락한 모델을 다시 고르는
+         셈이라 의미가 없고, 진짜 한계 초과라면 업스트림 4xx로 명확히 드러난다.
+    선택 근거는 reason("auto:tier=...,est=...")으로 x-llm-route 헤더에 노출된다.
     """
-    tier = _classify_complexity(request)
-    needs_tools = bool(request.tools)
     estimated_tokens = _estimate_tokens(request)
+    tier = _classify_tier(request, estimated_tokens)
+    needs_tools = bool(request.tools)
+    # 출력 예산까지 포함한 필요 토큰. max_tokens 미지정이면 입력만으로 판단
+    # (출력 여유분은 _CONTEXT_SAFETY_RATIO 마진이 흡수한다).
+    required_tokens = estimated_tokens + (request.max_tokens or 0)
 
-    chain: list[ModelSpec] = []
-    for name in AUTO_CANDIDATES_BY_TIER[tier]:
-        spec = MODELS[name]
-        if needs_tools and not spec.supports_tools:
-            continue
-        if spec.context_window < estimated_tokens:
-            continue
-        chain.append(spec)
+    candidates = [MODELS[name] for name in AUTO_CANDIDATES_BY_TIER[tier]]
+    if needs_tools:
+        candidates = [spec for spec in candidates if spec.supports_tools]
 
+    chain = [spec for spec in candidates if required_tokens <= _usable_context(spec)]
+    reason = f"auto:tier={tier},est={estimated_tokens}"
+
+    if not chain and candidates:
+        # 모든 후보의 창을 넘는 초대형 입력 — 그나마 가장 큰 창으로 best-effort
+        chain = [max(candidates, key=lambda spec: spec.context_window)]
+        reason += ",overflow=1"
     if not chain:
+        # 도구 필터로도 전원 탈락(현 레지스트리엔 없는 조합) — 최후 폴백
         chain = [MODELS[DEFAULT_MODEL]]
-    return RouteDecision(chain=chain, reason=f"auto:tier={tier}")
+    return RouteDecision(chain=chain, reason=reason)
 
 
 def resolve_live_model(requested: str | None, default: str) -> str:
