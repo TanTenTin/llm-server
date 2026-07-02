@@ -1,6 +1,8 @@
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import AsyncGenerator, Awaitable, Callable
 
 import anthropic
@@ -13,12 +15,18 @@ from app.providers.base import LLMProvider
 from app.providers.gemini import GeminiProvider
 from app.providers.ollama import OllamaProvider
 from app.registry import ModelSpec, RouteDecision
+from app.usage import UsageTracker
 
 # fallback을 유발하는 HTTP 상태 (provider가 일시적으로/구조적으로 못 받는 상황)
 #   404: 모델 미로드 · 408/409/429: 일시 과부하 · 5xx: provider 내부 오류
 #   529: Anthropic OverloadedError(가장 흔한 일시 장애)
 # 400/401/403(입력·인증 오류)는 재시도해도 동일 실패 → 포함하지 않음(즉시 실패)
 _RETRYABLE_STATUS = {404, 408, 409, 429, 500, 502, 503, 504, 529}
+
+# 동적 회로 쿨다운 상한(초). 업스트림이 알려준 Retry-After가 이보다 커도 1시간까지만
+# 미룬다 — 파싱 오류/비정상 값으로 provider가 사실상 영구 제외되는 것을 막는 안전판.
+# (RPD 소진처럼 진짜 긴 대기도 1시간마다 half-open 탐침이 실제 회복 시점을 잡아낸다)
+_MAX_DYNAMIC_COOLDOWN_SECONDS = 3600.0
 
 logger = logging.getLogger("llm_gateway")
 logger.setLevel(logging.INFO)  # uvicorn 루트 핸들러로 전파되어 출력됨
@@ -57,12 +65,32 @@ class CircuitBreaker:
             return False
         return True
 
-    def record_failure(self, provider: str) -> None:
-        if self._cooldown > 0:
-            self._open_until[provider] = time.monotonic() + self._cooldown
+    def record_failure(self, provider: str, cooldown_hint: float | None = None) -> float:
+        """
+        장애를 기록하고 실제 적용된 쿨다운(초)을 반환한다(로그 표기용).
+        `cooldown_hint`: 업스트림이 알려준 재시도 대기 시간(Retry-After/RetryInfo).
+        있으면 기본 쿨다운 대신 사용한다 — RPM 초과(수십 초)와 RPD 소진(수 시간)을
+        같은 30초로 취급해 헛때리던 문제를 해소. 상한으로 클램프해 안전을 보장한다.
+        """
+        if self._cooldown <= 0:
+            return 0.0  # 회로차단 비활성화 설정 존중 (힌트가 있어도 열지 않음)
+        cooldown = self._cooldown
+        if cooldown_hint is not None and cooldown_hint > 0:
+            cooldown = min(cooldown_hint, _MAX_DYNAMIC_COOLDOWN_SECONDS)
+        self._open_until[provider] = time.monotonic() + cooldown
+        return cooldown
 
     def record_success(self, provider: str) -> None:
         self._open_until.pop(provider, None)  # 성공하면 즉시 닫음
+
+    def status(self) -> dict[str, float]:
+        """현재 open 상태인 provider와 남은 쿨다운(초). 헬스체크/관측용."""
+        now = time.monotonic()
+        return {
+            provider: round(until - now, 1)
+            for provider, until in self._open_until.items()
+            if until > now
+        }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -110,6 +138,12 @@ class ProviderPool:
             self._providers["gemini"] = GeminiProvider(settings.google_ai_api_key)
         # provider별 일시 장애를 기억하는 회로차단기 (폴백 경로에서 참조)
         self.breaker = CircuitBreaker(settings.breaker_cooldown_seconds)
+        # 모델별 요청/토큰/에러 집계 (무료 티어 쿼터 관측 — /v1/usage로 노출)
+        self.usage = UsageTracker()
+
+    def registered(self) -> list[str]:
+        """등록된 provider 이름 목록 (헬스체크용)."""
+        return list(self._providers)
 
     def get(self, provider_type: str) -> LLMProvider:
         provider = self._providers.get(provider_type)
@@ -147,6 +181,19 @@ def _order_by_breaker(
     return fresh + deferred, deferred_labels
 
 
+def _error_kind(exc: Exception) -> str:
+    """사용량 집계용 에러 분류 라벨 — 상태 코드 우선("429" 등), 없으면 연결 계열."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return str(exc.response.status_code)
+    if isinstance(exc, anthropic.APIStatusError):
+        return str(exc.status_code)
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, (httpx.ConnectError, anthropic.APIConnectionError)):
+        return "connect"
+    return type(exc).__name__
+
+
 def _is_retryable(exc: Exception) -> bool:
     """다음 fallback 후보로 넘어갈 만한 에러인지 판단."""
     # 연결 실패 / 타임아웃 계열
@@ -161,6 +208,66 @@ def _is_retryable(exc: Exception) -> bool:
     elif isinstance(exc, anthropic.APIStatusError):
         status = exc.status_code
     return status in _RETRYABLE_STATUS if status is not None else False
+
+
+def _parse_retry_after_header(value: str) -> float | None:
+    """Retry-After 헤더 값 파싱: 초 단위 숫자 또는 HTTP-date 두 형식 모두 지원."""
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    delta = (retry_at - datetime.now(timezone.utc)).total_seconds()
+    return delta if delta > 0 else None
+
+
+def _parse_gemini_retry_info(body: dict) -> float | None:
+    """
+    Gemini 429 본문의 google.rpc.RetryInfo에서 재시도 대기 시간을 추출한다.
+    형식: {"error": {"details": [{"@type": ".../google.rpc.RetryInfo", "retryDelay": "58s"}]}}
+    """
+    details = body.get("error", {}).get("details", [])
+    if not isinstance(details, list):
+        return None
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        if "RetryInfo" not in str(detail.get("@type", "")):
+            continue
+        delay = str(detail.get("retryDelay", "")).rstrip("s")
+        try:
+            return float(delay)
+        except ValueError:
+            return None
+    return None
+
+
+def retry_after_seconds(exc: Exception) -> float | None:
+    """
+    업스트림 에러(주로 429)에서 '언제 다시 시도 가능한지' 힌트를 초 단위로 추출한다.
+    회로차단기의 동적 쿨다운에 사용 — RPM 초과(수십 초)와 RPD 소진(수 시간)을
+    구분해, 고정 쿨다운으로 헛때리거나 너무 일찍 재시도하는 것을 막는다.
+      1. 표준 Retry-After 헤더 (httpx/anthropic 예외 모두 .response가 httpx.Response)
+      2. Gemini 429 본문의 RetryInfo.retryDelay
+    힌트가 없거나 파싱 불가면 None → 기본 쿨다운 사용.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    header = response.headers.get("retry-after")
+    if header:
+        parsed = _parse_retry_after_header(header)
+        if parsed is not None:
+            return parsed
+    # 본문은 provider가 미리 읽어둔 경우에만 접근 가능(스트리밍 경로 포함) — 실패는 조용히 무시
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    return _parse_gemini_retry_info(body) if isinstance(body, dict) else None
 
 
 def error_detail(exc: Exception) -> str:
@@ -237,25 +344,32 @@ async def run_chat_fallback(
             result = await invoke(spec)
         except ProviderUnavailable as e:
             last_exc = e  # 미설정 provider → 다음 후보로 (회로차단 대상 아님: 영구 설정 문제)
+            pool.usage.record_error(label, "unavailable")
             if trace is not None:
                 trace.attempts.append(f"{label}#unavailable")
             continue
         except Exception as e:
             if not _is_retryable(e):
                 raise  # 입력/인증 오류 등은 즉시 실패
-            breaker.record_failure(spec.provider)  # 일시 장애 → 회로 open
+            cooldown = breaker.record_failure(spec.provider, retry_after_seconds(e))
+            pool.usage.record_error(label, _error_kind(e))
             last_exc = e
             if trace is not None:
                 trace.attempts.append(f"{label}#retryable")
-            logger.warning("[route] %s 일시 장애(%s) → 회로 open, 다음 후보로", label, type(e).__name__)
+            logger.warning(
+                "[route] %s 일시 장애(%s) → 회로 open %.0fs, 다음 후보로",
+                label, type(e).__name__, cooldown,
+            )
             continue
         # 성공
         breaker.record_success(spec.provider)
+        fell_back = idx > 0 or bool(deferred)
+        pool.usage.record_success(label, result, fell_back)
         if trace is not None:
             trace.served = label
-            trace.fell_back = idx > 0 or bool(deferred)
+            trace.fell_back = fell_back
             trace.attempts.append(f"{label}#ok")
-        logger.info("[route] 응답=%s (fallback=%s)", label, idx > 0 or bool(deferred))
+        logger.info("[route] 응답=%s (fallback=%s)", label, fell_back)
         return result
     raise last_exc if last_exc is not None else RuntimeError("라우팅 후보가 없습니다")
 
@@ -286,6 +400,7 @@ async def run_stream_fallback(
             gen = open_stream(spec)  # pool.get 등에서 ProviderUnavailable 가능
         except ProviderUnavailable as e:
             last_exc = e
+            pool.usage.record_error(label, "unavailable")
             if trace is not None:
                 trace.attempts.append(f"{label}#unavailable")
             continue
@@ -297,6 +412,7 @@ async def run_stream_fallback(
         except StopAsyncIteration:
             await aclose_quietly(gen)
             breaker.record_success(spec.provider)  # 빈 스트림이라도 연결은 정상
+            pool.usage.record_success(label, None, idx > 0 or bool(deferred))
             if trace is not None:
                 trace.served = label
                 trace.fell_back = idx > 0 or bool(deferred)
@@ -306,20 +422,27 @@ async def run_stream_fallback(
             await aclose_quietly(gen)
             if not _is_retryable(e):
                 raise
-            breaker.record_failure(spec.provider)  # 일시 장애 → 회로 open
+            cooldown = breaker.record_failure(spec.provider, retry_after_seconds(e))
+            pool.usage.record_error(label, _error_kind(e))
             last_exc = e
             if trace is not None:
                 trace.attempts.append(f"{label}#retryable")
-            logger.warning("[route] %s 스트림 시작 실패(%s) → 회로 open, 다음 후보로", label, type(e).__name__)
+            logger.warning(
+                "[route] %s 스트림 시작 실패(%s) → 회로 open %.0fs, 다음 후보로",
+                label, type(e).__name__, cooldown,
+            )
             continue
 
         # 첫 청크 확보 — 이후엔 fallback 없이 끝까지 흘려보내되 항상 정리
+        # (스트리밍은 토큰 집계 없이 요청 수만 센다 — usage.py 모듈 설명 참고)
         breaker.record_success(spec.provider)
+        fell_back = idx > 0 or bool(deferred)
+        pool.usage.record_success(label, None, fell_back)
         if trace is not None:
             trace.served = label
-            trace.fell_back = idx > 0 or bool(deferred)
+            trace.fell_back = fell_back
             trace.attempts.append(f"{label}#ok")
-        logger.info("[route] 스트림=%s (fallback=%s)", label, idx > 0 or bool(deferred))
+        logger.info("[route] 스트림=%s (fallback=%s)", label, fell_back)
         try:
             yield first
             async for chunk in gen:

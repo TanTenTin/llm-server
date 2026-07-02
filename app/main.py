@@ -109,7 +109,57 @@ app = FastAPI(title="LLM Gateway", version="0.2.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health() -> dict:
+    """가벼운 생존 확인 (docker healthcheck 등 무인증 프로브용) — 항상 ok."""
     return {"status": "ok"}
+
+
+# 게이트웨이가 알 수 있는 provider 전체 집합. 등록 여부와 무관하게 상태를 보여줘
+# "키 미설정으로 미등록"을 침묵 아닌 명시적 false로 드러낸다.
+_KNOWN_PROVIDERS = ("gemini", "anthropic", "ollama")
+
+
+@app.get("/health/providers")
+async def health_providers(_auth: None = Depends(require_auth)) -> dict:
+    """
+    심층 헬스체크 — "왜 자꾸 로컬로 폴백되지?"를 로그 없이 진단하기 위한 상태 노출.
+      - registered: provider 등록 여부 (false면 API 키 미설정 → ProviderUnavailable 폴백)
+      - breaker_open / breaker_remaining_seconds: 회로차단기 상태 (일시 장애로 뒤로 밀림)
+      - reachable(Ollama만): /api/version 실측 프로브 — 로컬 폴백의 최후 보루가
+        실제로 살아있는지. 클라우드 provider는 매 요청이 곧 프로브라 별도 확인 안 함.
+    키 설정 여부가 드러나므로 게이트웨이 인증을 요구한다.
+    """
+    pool: ProviderPool = app.state.pool
+    registered = set(pool.registered())
+    breaker_status = pool.breaker.status()
+
+    providers: dict[str, dict] = {}
+    for name in _KNOWN_PROVIDERS:
+        info: dict = {"registered": name in registered}
+        if name in registered:
+            info["breaker_open"] = name in breaker_status
+            if name in breaker_status:
+                info["breaker_remaining_seconds"] = breaker_status[name]
+        providers[name] = info
+
+    if "ollama" in registered:
+        try:
+            resp = await pool.get("ollama").client.get("/api/version", timeout=2.0)
+            providers["ollama"]["reachable"] = resp.status_code == 200
+        except Exception:
+            providers["ollama"]["reachable"] = False
+
+    return {"status": "ok", "providers": providers}
+
+
+@app.get("/v1/usage")
+async def usage(_auth: None = Depends(require_auth)) -> dict:
+    """
+    모델별(provider:model × UTC 일 단위) 사용량 스냅샷 — 요청 수·토큰·에러(429 등)·
+    폴백 응답 횟수. 무료 티어 쿼터를 얼마나 썼는지 게이트웨이 스스로 관측하기 위한
+    인메모리 집계(재기동 시 리셋, 최근 7일 보존). 스트리밍은 요청 수만 집계된다.
+    """
+    pool: ProviderPool = app.state.pool
+    return pool.usage.snapshot()
 
 
 @app.get("/v1/models")

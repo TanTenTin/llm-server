@@ -290,11 +290,32 @@ WS /v1/realtime
 
 > **한계(v1)**: 함수 호출(`toolCall`)·이미지/비디오 입력은 미지원(오디오·텍스트만). `session.update`의 model 변경은 첫 입력 전(=setup 전송 전)에만 반영된다(Gemini setup은 1회성). Live는 로컬 대체가 없어 **fallback 하지 않는다**(텍스트 경로의 ProviderPool/회로차단기와 독립).
 
-### 헬스 체크
+### 헬스 체크 / 관측
 
 ```
-GET /health   →   { "status": "ok" }
+GET /health             →   { "status": "ok" }                    # 무인증 생존 확인 (docker healthcheck용)
+GET /health/providers   →   provider별 심층 상태 (인증 필요)
+GET /v1/usage           →   모델별 사용량 집계 (인증 필요)
 ```
+
+`/health/providers` — "왜 자꾸 로컬로 폴백되지?"를 로그 없이 진단:
+
+```json
+{
+  "status": "ok",
+  "providers": {
+    "gemini":    { "registered": true, "breaker_open": true, "breaker_remaining_seconds": 512.3 },
+    "anthropic": { "registered": false },
+    "ollama":    { "registered": true, "breaker_open": false, "reachable": true }
+  }
+}
+```
+
+- `registered: false` = API 키 미설정 → 해당 provider 요청은 폴백으로 빠진다.
+- `breaker_open: true` = 일시 장애(429 등)로 회로차단기가 열려 폴백 체인 뒤로 밀린 상태.
+- `reachable`(Ollama만) = `/api/version` 실측 프로브 — 로컬 폴백의 최후 보루 생존 확인.
+
+`/v1/usage` — 무료 티어 쿼터를 얼마나 썼는지 게이트웨이 스스로 집계(provider:model × UTC 일 단위, 최근 7일, 인메모리라 재기동 시 리셋). 요청 수·프롬프트/응답 토큰·에러 종류별 횟수(`429` 등)·폴백 응답 횟수를 노출한다. 스트리밍 응답은 요청 수만 집계된다.
 
 ### curl로 빠른 테스트
 
@@ -337,17 +358,20 @@ response = await client.chat.completions.create(
 
 `model="auto"`로 보내면 게이트웨이가 **요청 특성을 보고 직접 모델을 고른다**. 클라이언트는 어떤 모델이 있는지 몰라도 된다.
 
-- **난이도 분기(`tier`)**: 먼저 요청 난이도를 `simple`/`complex`로 판단해 티어별 후보 셋을 고른다.
+- **티어 분기(`tier`)**: 먼저 입력 크기를 추정하고 요청을 `simple`/`complex`/`long` 셋 중 하나로 분류해 티어별 후보 셋을 고른다.
   - `simple` → `gemini-2.5-flash-lite` → `ollama/qwen3:14b` (가볍고 빠름): 인사·단순 단발 질의
   - `complex` → `gemini-2.5-flash` → `ollama/qwen3:14b` (강한 모델): 도구 사용·긴 입력(≥1200토큰)·긴 멀티턴(≥6메시지)·추론성 키워드(분석/설계/디버그/구현 등)
+  - `long` → `gemini-2.5-flash` → `gemini-2.5-flash-lite` (1M 컨텍스트): 추정 입력 ≥25k 토큰. **난이도보다 우선** — 아무리 단순한 요청도 로컬 창(32k)을 넘으면 큰 컨텍스트 모델로 직행한다.
 - **후보**: 무료만, 비용·품질 우선순위 순. **과금(Claude)은 auto가 자동 선택하지 않는다**(비용 0 보장 — Claude가 필요하면 모델명을 명시).
-- **필터**: 도구(`tools`)를 쓰는 요청인데 도구 미지원 모델은 제외, 추정 입력 토큰이 `context_window`를 초과하는 모델은 제외. (예: 입력이 ~66k 토큰이면 32k 로컬은 빠지고 1M Gemini만 남는다.)
-- **토큰 추정**: 메시지+도구 정의의 문자 수 ÷ 3 (정확한 토큰화가 아니라 "로컬에 들어가나, 큰 컨텍스트가 필요한가" 판단용 근사치).
-- 선택 사유는 `x-llm-route` 헤더에 `reason=auto:tier=complex`로 노출된다. 살아남은 후보가 그대로 폴백 체인이 되므로 **회로차단기·`x-llm-route` 헤더가 동일하게 적용**된다.
+- **필터**: 도구(`tools`)를 쓰는 요청인데 도구 미지원 모델은 제외. 컨텍스트는 `추정 입력 + max_tokens(출력 예산)` 이 **usable 창(`context_window` × 0.8 안전 마진)** 을 초과하는 모델을 제외한다 — 추정이 근사치인 데다 로컬은 입력·출력이 한 창을 나눠 쓰기 때문. (예: 입력 20k 토큰 + `max_tokens=8k` 면 32k 로컬은 빠진다.)
+- **overflow best-effort**: 모든 후보의 usable 창(1M×0.8=800k)마저 넘는 초대형 입력이면, 후보 중 창이 가장 큰 모델 1개를 best-effort로 시도하고 `reason`에 `overflow=1`을 표시한다(무의미한 DEFAULT_MODEL 폴백 대신 — 진짜 한계 초과면 업스트림 4xx로 드러난다).
+- **토큰 추정**: 메시지 + 멀티턴 `tool_calls`(함수 인자) + 도구 정의의 문자 수 ÷ 3 (정확한 토큰화가 아니라 "로컬에 들어가나, 큰 컨텍스트가 필요한가" 판단용 근사치).
+- 선택 사유는 `x-llm-route` 헤더에 `reason=auto:tier=complex,est=1500` 형태(티어 + 추정 토큰)로 노출된다. 살아남은 후보가 그대로 폴백 체인이 되므로 **회로차단기·`x-llm-route` 헤더가 동일하게 적용**된다.
 
 - **명시적 prefix가 콜론보다 우선**한다 → 미등록 `claude-x:snapshot`도 Anthropic으로, prefix 없는 `qwen3:14b`는 Ollama로 라우팅된다.
 - **Fallback**: 레지스트리 모델에 `fallback`을 지정하면(예: `claude-sonnet-4-6` → `ollama/qwen3:14b`) provider 장애·과부하(연결/타임아웃/5xx/529/모델없음)나 키 미설정 시 다음 후보로 자동 전환된다. 스트리밍은 첫 토큰 전까지만 fallback 가능.
-- **회로차단기(circuit breaker)**: 어떤 provider가 일시 장애(429/5xx/연결오류)를 내면 `BREAKER_COOLDOWN_SECONDS` 동안 그 provider를 폴백 체인 **뒤로 미룬다**. 무료 티어(Gemini)가 429로 막히면 잠깐 로컬(Ollama)을 우선시켜 **매 요청 primary부터 헛때리는 지연을 제거**한다. 쿨다운이 지나면 자동으로 다시 우선순위에 올린다(half-open). 미뤄진 후보도 다른 후보가 모두 실패하면 결국 시도하므로 누락은 없다.
+- **회로차단기(circuit breaker)**: 어떤 provider가 일시 장애(429/5xx/연결오류)를 내면 그 provider를 폴백 체인 **뒤로 미룬다**. 무료 티어(Gemini)가 429로 막히면 잠깐 로컬(Ollama)을 우선시켜 **매 요청 primary부터 헛때리는 지연을 제거**한다. 쿨다운이 지나면 자동으로 다시 우선순위에 올린다(half-open). 미뤄진 후보도 다른 후보가 모두 실패하면 결국 시도하므로 누락은 없다.
+- **동적 쿨다운(Retry-After 반영)**: 쿨다운은 기본 `BREAKER_COOLDOWN_SECONDS`(30초)지만, 업스트림 429 응답에 `Retry-After` 헤더나 Gemini `RetryInfo`(`retryDelay`)가 실려 있으면 **그 값을 그대로 쿨다운으로 쓴다**(상한 1시간 클램프). RPM 초과(수십 초)와 RPD 소진(수 시간)을 같은 30초로 취급해 헛때리던 문제를 해소 — 힌트가 5초면 5초만 기다리고, 하루 쿼터 소진이면 1시간 단위 half-open 탐침으로 전환된다.
 - **관측성(`x-llm-route` 헤더)**: 응답 본문은 OpenAI 형식 그대로 두고, 실제 라우팅 결과는 `x-llm-route` 응답 헤더로 노출한다 — 예: `requested=gemini-2.5-flash; served=ollama:qwen3:14b; fallback=1`. silent fallback이 일어나도 *무엇이 실제로 응답했는지* 헤더/로그로 바로 확인할 수 있다(호출 측 코드 변경 불필요).
 - **모델 추가/별칭/fallback 변경은 `app/registry.py`의 `MODELS`·`ALIASES`만** 수정하면 된다(`/v1/models` 목록도 자동 반영).
 
@@ -449,8 +473,9 @@ docker compose exec ollama ollama pull qwen3.6:27b
 
 ### 2. CI/CD (GitHub Actions)
 
-`main`에 `app/**` · `Dockerfile` · `docker-compose.yml` · `requirements.txt` 변경을 push하면
-`.github/workflows/deploy.yml`이 rsync(`.env` 제외) → `docker compose up -d --build` 한다.
+`main`에 `app/**` · `tests/**` · `Dockerfile` · `docker-compose.yml` · `requirements.txt` 변경을 push하면
+`.github/workflows/deploy.yml`이 **pytest를 먼저 실행하고(테스트 게이트), 통과 시에만**
+rsync(`.env` 제외) → `docker compose up -d --build` 한다. 테스트가 깨지면 운영에 나가지 않는다.
 
 필요한 GitHub Secrets:
 
