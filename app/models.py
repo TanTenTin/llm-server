@@ -39,6 +39,18 @@ class Message(BaseModel):
     name: Optional[str] = None
 
 
+class EmbeddingsRequest(BaseModel):
+    """OpenAI 호환 embeddings 요청 (/v1/embeddings). Gemini·Ollama 업스트림으로 패스스루."""
+    model_config = _ALLOW_EXTRA
+
+    model: str
+    # 단일 문자열 또는 배치(문자열 배열). 토큰 id 배열 등도 그대로 업스트림에 전달
+    input: Union[str, List[Any]]
+    dimensions: Optional[int] = None
+    encoding_format: Optional[str] = None
+    user: Optional[str] = None
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = _ALLOW_EXTRA
 

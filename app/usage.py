@@ -69,17 +69,26 @@ class UsageTracker:
     def __init__(self) -> None:
         # 날짜("2026-07-02") → 라벨("gemini:gemini-2.5-flash") → 카운터
         self._days: dict[str, dict[str, ModelDayUsage]] = {}
+        # 날짜 → 과금(is_free=False) provider가 소비한 토큰 합. 예산 가드(P1)의 판단 근거
+        self._paid_tokens: dict[str, int] = {}
         self._started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).date().isoformat()
 
     def _bucket(self, label: str) -> ModelDayUsage:
         """오늘 날짜·라벨의 카운터를 확보하고, 보존 기간을 넘긴 날짜는 정리한다."""
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = self._today()
         if today not in self._days and len(self._days) >= RETENTION_DAYS:
             for stale in sorted(self._days)[: len(self._days) - RETENTION_DAYS + 1]:
                 del self._days[stale]
+                self._paid_tokens.pop(stale, None)
         return self._days.setdefault(today, {}).setdefault(label, ModelDayUsage())
 
-    def record_success(self, label: str, body: dict | None, fell_back: bool) -> None:
+    def record_success(
+        self, label: str, body: dict | None, fell_back: bool, is_free: bool = True
+    ) -> None:
         """성공 응답 집계. body가 없으면(스트리밍) 요청 수만 센다."""
         bucket = self._bucket(label)
         bucket.requests += 1
@@ -89,6 +98,13 @@ class UsageTracker:
             prompt, completion = _extract_usage(body)
             bucket.prompt_tokens += prompt
             bucket.completion_tokens += completion
+            if not is_free:
+                today = self._today()
+                self._paid_tokens[today] = self._paid_tokens.get(today, 0) + prompt + completion
+
+    def paid_tokens_today(self) -> int:
+        """오늘(UTC) 과금 provider가 소비한 토큰 합. 예산 가드가 매 후보 시도 전에 조회."""
+        return self._paid_tokens.get(self._today(), 0)
 
     def record_error(self, label: str, kind: str) -> None:
         """실패 시도 집계. kind는 상태 코드("429")나 분류("connect"/"unavailable")."""
@@ -119,4 +135,5 @@ class UsageTracker:
             "retention_days": RETENTION_DAYS,
             "days": days,
             "totals": totals,
+            "paid_tokens_by_day": dict(sorted(self._paid_tokens.items())),
         }

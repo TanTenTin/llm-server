@@ -4,9 +4,9 @@ import uuid
 import httpx
 from typing import AsyncGenerator
 
-from app.models import ChatCompletionRequest
+from app.models import ChatCompletionRequest, EmbeddingsRequest
 from app.providers.base import LLMProvider
-from app.providers.openai_payload import build_openai_payload
+from app.providers.openai_payload import build_embeddings_payload, build_openai_payload
 from app.registry import ModelSpec
 
 TIMEOUT = 120.0
@@ -78,6 +78,14 @@ class OllamaProvider(LLMProvider):
         payload = self._build_payload(request, spec)
         payload["stream"] = False
         response = await self.client.post("/v1/chat/completions", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    async def embed(self, request: EmbeddingsRequest, spec: ModelSpec) -> dict:
+        """Ollama OpenAI 호환 /v1/embeddings 프록시. 모델은 사전 pull 필요(미설치면 404 → 폴백)."""
+        response = await self.client.post(
+            "/v1/embeddings", json=build_embeddings_payload(request, spec)
+        )
         response.raise_for_status()
         return response.json()
 

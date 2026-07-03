@@ -96,8 +96,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `GOOGLE_AI_API_KEY` | `""` (빈 값) | Gemini API 키. `gemini-*`(기본 모델) 사용 시 필요. 비면 Gemini 미등록 → 로컬 fallback |
 | `ANTHROPIC_API_KEY` | `""` (빈 값) | Anthropic API 키. `claude-*` 모델 사용 시 필요 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소. Docker 배포 시 compose가 `http://ollama:11434`로 주입 |
-| `GATEWAY_API_KEY` | `""` (빈 값) | 게이트웨이 공유 인증 토큰. 설정 시 `/v1/*` 요청에 `Authorization: Bearer <키>` 필요. **외부 노출 시 반드시 설정** |
-| `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). provider가 일시 장애(429/5xx/연결오류)를 내면 이 시간 동안 폴백 체인 뒤로 미뤄 헛때리는 지연을 제거하고, 만료 시 자동 복귀. `0` 이하면 비활성화 |
+| `GATEWAY_API_KEY` | `""` (빈 값) | 게이트웨이 인증 토큰. 설정 시 `/v1/*` 요청에 `Authorization: Bearer <키>` 필요. **쉼표 구분 복수 키 지원**(`"key-a, key-b"` — 클라이언트별 발급/회수). **외부 노출 시 반드시 설정** |
+| `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). provider가 일시 장애(429/5xx/연결오류)를 내면 이 시간 동안 폴백 체인 뒤로 미뤄 헛때리는 지연을 제거하고, 만료 시 자동 복귀. `0` 이하면 비활성화. 업스트림 429의 `Retry-After`/`RetryInfo` 힌트가 있으면 그 값을 우선(상한 1시간) |
+| `CACHE_TTL_SECONDS` | `300.0` | 응답 캐시 TTL(초). 비스트리밍 + `temperature` 미지정/0 인 동일 요청(`/v1/chat/completions`)을 캐시해 무료 쿼터 소모를 줄인다. `0` 이하면 비활성화 |
+| `PAID_DAILY_TOKEN_BUDGET` | `0` (무제한) | 과금(paid) provider 일일 토큰 예산. Claude 등 유료 모델의 하루(UTC) 토큰 합이 넘으면 해당 후보를 건너뜀(무료 폴백이 있으면 그쪽으로, 없으면 402). 에이전트 루프 폭주로 인한 과금 사고 방지 |
+| `RATE_LIMIT_RPM` | `0` (무제한) | 분당 요청 상한. 키 설정 시 키별, 미설정 시 클라이언트 IP별로 집계. 초과 시 429 + `Retry-After` |
 | `REALTIME_DEFAULT_MODEL` | `gemini-2.5-flash-native-audio-preview-09-2025` | `/v1/realtime`에서 클라이언트가 모델을 지정하지 않을 때 쓸 Gemini Live 모델 id. **계정에서 사용 가능한 정확한 id로 교체할 것** |
 | `REALTIME_INPUT_SAMPLE_RATE` | `24000` | 클라이언트가 보내는 입력 PCM16 샘플레이트(Hz). OpenAI Realtime 기본 24000. Gemini Live 입력은 16000을 요구하므로 다르면 브리지가 16kHz로 리샘플(같으면 건너뜀) |
 
@@ -105,7 +108,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 OpenAI SDK / 호환 클라이언트에서 `base_url`만 바꾸면 바로 사용 가능하다.
 
-> **인증**: `GATEWAY_API_KEY`가 설정돼 있으면 `/v1/*` 요청에 `Authorization: Bearer <키>` 헤더가 필요하다(미설정 시 개방). `/health`는 인증 없이 접근 가능.
+> **인증**: `GATEWAY_API_KEY`가 설정돼 있으면 `/v1/*` 요청에 `Authorization: Bearer <키>` 헤더가 필요하다(미설정 시 개방, 쉼표 구분 복수 키 허용). `/health`는 인증 없이 접근 가능. `RATE_LIMIT_RPM` 설정 시 키별(미설정이면 IP별) 분당 요청 상한이 걸리고 초과 시 429 + `Retry-After`를 반환한다.
 >
 > 네이티브 엔드포인트(`/v1/messages`·`generateContent`)는 각 SDK가 키를 싣는 방식을 그대로 받는다 — `Authorization: Bearer <키>` 외에 Anthropic SDK의 `x-api-key: <키>`, Gemini SDK의 `x-goog-api-key: <키>`/`?key=<키>` 도 게이트웨이 토큰으로 검증한다.
 
@@ -255,13 +258,32 @@ curl "http://localhost:8000/v1beta/models/claude-sonnet-4-6:generateContent?key=
 
 > **네이티브 어댑터 한계(v1)**: ① Gemini `functionResponse`에는 호출 id가 없어 `functionCall`/`functionResponse`를 **이름 기반(`call_<name>`)으로 매칭**한다 — 같은 이름 도구를 한 턴에 여러 번 호출하면 충돌할 수 있다. ② `/v1/messages`의 Anthropic 후보는 패스스루 fast-path라 스트리밍 tool_use가 정상 보존되지만, **OpenAI 엔드포인트(`/v1/chat/completions`)로 `claude-*`를 호출할 때**는 여전히 provider의 스트리밍 tool_use 미지원 한계(아래 [제약사항](#제약사항--알려진-한계))를 따른다. ③ 에러 응답은 게이트웨이 공통 포맷(`{"detail": ...}`)으로, 각 SDK의 네이티브 에러 포맷과 다르다.
 
+### Embeddings
+
+```
+POST /v1/embeddings
+```
+
+OpenAI 호환 embeddings 엔드포인트(RAG 에이전트용). **Gemini embedding(무료) 우선, 장애·키 미설정 시 로컬 Ollama로 폴백** — chat과 동일한 fallback 루프(회로차단기·`x-llm-route`·사용량 집계)를 재사용한다. Anthropic은 임베딩 API가 없어 라우팅 대상에서 제외된다.
+
+```json
+{ "model": "embed", "input": ["문장 1", "문장 2"] }
+```
+
+- **모델**: `gemini-embedding-001`(기본) / `ollama/nomic-embed-text` / `ollama/<모델>` 패스스루. OpenAI SDK 기본 모델명(`text-embedding-3-small`/`-large`)과 별칭 `embed`는 기본 모델로 매핑되므로 **클라이언트 코드 수정 없이 연동**된다.
+- 로컬 폴백을 쓰려면 서버에 `ollama pull nomic-embed-text` 필요.
+
+### 응답 캐시
+
+`/v1/chat/completions`의 **비스트리밍 + `temperature` 미지정/0** 요청은 `CACHE_TTL_SECONDS`(기본 5분) 동안 exact-match 캐시된다 — 에이전트가 동일 요청을 재시도할 때 업스트림을 다시 때리지 않아 **무료 티어 쿼터를 절약**한다. 캐시 여부는 `x-llm-cache: hit|miss` 헤더로 노출되고, 히트는 `/v1/usage`에 `cache` 라벨로 집계된다. 요청이 1비트라도 다르면(모델·메시지·파라미터) 다른 키가 되어 오염이 없다.
+
 ### 모델 목록
 
 ```
 GET /v1/models
 ```
 
-> `app/registry.py`의 `MODELS` 레지스트리에서 자동 생성된다(실제 Ollama 설치 모델을 조회하지는 않음). 모델 추가는 `MODELS`만 수정하면 이 목록에도 반영된다.
+> `app/registry.py`의 `MODELS`·`EMBEDDING_MODELS` 레지스트리에서 자동 생성된다(실제 Ollama 설치 모델을 조회하지는 않음). 모델 추가는 레지스트리만 수정하면 이 목록에도 반영된다.
 
 ### Realtime (음성) API
 
@@ -363,7 +385,7 @@ response = await client.chat.completions.create(
   - `complex` → `gemini-2.5-flash` → `ollama/qwen3:14b` (강한 모델): 도구 사용·긴 입력(≥1200토큰)·긴 멀티턴(≥6메시지)·추론성 키워드(분석/설계/디버그/구현 등)
   - `long` → `gemini-2.5-flash` → `gemini-2.5-flash-lite` (1M 컨텍스트): 추정 입력 ≥25k 토큰. **난이도보다 우선** — 아무리 단순한 요청도 로컬 창(32k)을 넘으면 큰 컨텍스트 모델로 직행한다.
 - **후보**: 무료만, 비용·품질 우선순위 순. **과금(Claude)은 auto가 자동 선택하지 않는다**(비용 0 보장 — Claude가 필요하면 모델명을 명시).
-- **필터**: 도구(`tools`)를 쓰는 요청인데 도구 미지원 모델은 제외. 컨텍스트는 `추정 입력 + max_tokens(출력 예산)` 이 **usable 창(`context_window` × 0.8 안전 마진)** 을 초과하는 모델을 제외한다 — 추정이 근사치인 데다 로컬은 입력·출력이 한 창을 나눠 쓰기 때문. (예: 입력 20k 토큰 + `max_tokens=8k` 면 32k 로컬은 빠진다.)
+- **필터**: 도구(`tools`)를 쓰는 요청인데 도구 미지원 모델은 제외. **이미지(`image_url`)가 포함된 요청인데 vision 미지원 모델도 제외**(`supports_vision` — 이미지가 텍스트 전용 로컬로 폴백돼 조용히 무시되는 것을 방지, reason에 `vision=1` 표시). 컨텍스트는 `추정 입력 + max_tokens(출력 예산)` 이 **usable 창(`context_window` × 0.8 안전 마진)** 을 초과하는 모델을 제외한다 — 추정이 근사치인 데다 로컬은 입력·출력이 한 창을 나눠 쓰기 때문. (예: 입력 20k 토큰 + `max_tokens=8k` 면 32k 로컬은 빠진다.)
 - **overflow best-effort**: 모든 후보의 usable 창(1M×0.8=800k)마저 넘는 초대형 입력이면, 후보 중 창이 가장 큰 모델 1개를 best-effort로 시도하고 `reason`에 `overflow=1`을 표시한다(무의미한 DEFAULT_MODEL 폴백 대신 — 진짜 한계 초과면 업스트림 4xx로 드러난다).
 - **토큰 추정**: 메시지 + 멀티턴 `tool_calls`(함수 인자) + 도구 정의의 문자 수 ÷ 3 (정확한 토큰화가 아니라 "로컬에 들어가나, 큰 컨텍스트가 필요한가" 판단용 근사치).
 - 선택 사유는 `x-llm-route` 헤더에 `reason=auto:tier=complex,est=1500` 형태(티어 + 추정 토큰)로 노출된다. 살아남은 후보가 그대로 폴백 체인이 되므로 **회로차단기·`x-llm-route` 헤더가 동일하게 적용**된다.
@@ -372,6 +394,7 @@ response = await client.chat.completions.create(
 - **Fallback**: 레지스트리 모델에 `fallback`을 지정하면(예: `claude-sonnet-4-6` → `ollama/qwen3:14b`) provider 장애·과부하(연결/타임아웃/5xx/529/모델없음)나 키 미설정 시 다음 후보로 자동 전환된다. 스트리밍은 첫 토큰 전까지만 fallback 가능.
 - **회로차단기(circuit breaker)**: 어떤 provider가 일시 장애(429/5xx/연결오류)를 내면 그 provider를 폴백 체인 **뒤로 미룬다**. 무료 티어(Gemini)가 429로 막히면 잠깐 로컬(Ollama)을 우선시켜 **매 요청 primary부터 헛때리는 지연을 제거**한다. 쿨다운이 지나면 자동으로 다시 우선순위에 올린다(half-open). 미뤄진 후보도 다른 후보가 모두 실패하면 결국 시도하므로 누락은 없다.
 - **동적 쿨다운(Retry-After 반영)**: 쿨다운은 기본 `BREAKER_COOLDOWN_SECONDS`(30초)지만, 업스트림 429 응답에 `Retry-After` 헤더나 Gemini `RetryInfo`(`retryDelay`)가 실려 있으면 **그 값을 그대로 쿨다운으로 쓴다**(상한 1시간 클램프). RPM 초과(수십 초)와 RPD 소진(수 시간)을 같은 30초로 취급해 헛때리던 문제를 해소 — 힌트가 5초면 5초만 기다리고, 하루 쿼터 소진이면 1시간 단위 half-open 탐침으로 전환된다.
+- **과금 예산 가드**: `PAID_DAILY_TOKEN_BUDGET` 설정 시 과금(`is_free=False`) 모델의 하루(UTC) 토큰 합이 예산을 넘으면 **그 후보를 건너뛴다** — 폴백 체인에 무료 후보가 있으면 그쪽으로(trace에 `#budget`), 없으면 402를 반환한다. 에이전트 루프 폭주로 인한 Claude 과금 사고를 게이트웨이 수준에서 차단. (한계: 스트리밍 응답은 토큰이 집계되지 않아 예산 소모로 잡히지 않는다.)
 - **관측성(`x-llm-route` 헤더)**: 응답 본문은 OpenAI 형식 그대로 두고, 실제 라우팅 결과는 `x-llm-route` 응답 헤더로 노출한다 — 예: `requested=gemini-2.5-flash; served=ollama:qwen3:14b; fallback=1`. silent fallback이 일어나도 *무엇이 실제로 응답했는지* 헤더/로그로 바로 확인할 수 있다(호출 측 코드 변경 불필요).
 - **모델 추가/별칭/fallback 변경은 `app/registry.py`의 `MODELS`·`ALIASES`만** 수정하면 된다(`/v1/models` 목록도 자동 반영).
 

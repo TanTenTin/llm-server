@@ -1,3 +1,4 @@
+import hashlib
 import secrets
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Awaitable, Callable, Optional
@@ -5,6 +6,9 @@ from typing import AsyncGenerator, Awaitable, Callable, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.ratelimit import RateLimiter
+
+from app.cache import ResponseCache, cache_key_for
 from app.adapters import (
     anthropic_to_chat_request,
     gemini_to_chat_request,
@@ -14,9 +18,17 @@ from app.adapters import (
     stream_openai_to_gemini,
 )
 from app.config import settings
-from app.models import ChatCompletionRequest
+from app.models import ChatCompletionRequest, EmbeddingsRequest
 from app.realtime import RealtimeBridge
-from app.registry import AUTO_ROUTE, MODELS, ModelSpec, RouteDecision, route
+from app.registry import (
+    AUTO_ROUTE,
+    EMBEDDING_MODELS,
+    MODELS,
+    ModelSpec,
+    RouteDecision,
+    resolve_embedding,
+    route,
+)
 from app.service import (
     ProviderPool,
     RouteTrace,
@@ -30,35 +42,83 @@ from app.service import (
 )
 
 
-def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
+# 분당 요청 제한기 (RATE_LIMIT_RPM=0 이면 비활성). 단일 프로세스 인메모리.
+_rate_limiter = RateLimiter(settings.rate_limit_rpm)
+
+
+def _gateway_keys() -> list[str]:
     """
-    게이트웨이 공유 토큰 검증. `GATEWAY_API_KEY`가 설정된 경우에만 강제한다.
-    미설정(빈 값)이면 통과 — 내부/로컬 사용을 막지 않기 위함이나, 외부 노출 시엔
-    반드시 키를 설정해야 한다(인증 없는 LLM 프록시 = Anthropic 과금/오남용 위험).
-    타이밍 공격 방지를 위해 상수 시간 비교(compare_digest)를 사용한다.
+    허용 게이트웨이 키 목록. `GATEWAY_API_KEY`는 쉼표 구분 복수 키를 지원한다
+    (클라이언트별 키 발급/회수 용도 — 예: "key-agent1, key-agent2").
+    빈 값이면 인증 개방(내부/로컬 사용).
     """
-    if not settings.gateway_api_key:
+    return [k.strip() for k in settings.gateway_api_key.split(",") if k.strip()]
+
+
+def _token_matches(token: str, keys: list[str]) -> bool:
+    """상수 시간 비교(compare_digest)로 키 목록과 대조. 매칭돼도 전체를 순회한다."""
+    matched = False
+    for key in keys:
+        if secrets.compare_digest(token, key):
+            matched = True
+    return matched
+
+
+def _enforce_rate_limit(http_request: Request, token: Optional[str]) -> None:
+    """
+    키(해시) 또는 클라이언트 IP 단위 분당 요청 제한. 초과 시 429 + Retry-After.
+    인증을 통과한 뒤에 호출된다(무인증 401 요청으로 남의 윈도우를 소모하지 못하게).
+    """
+    if not _rate_limiter.enabled:
         return
-    expected = f"Bearer {settings.gateway_api_key}"
-    if authorization is None or not secrets.compare_digest(authorization, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if token:
+        identity = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    else:
+        identity = http_request.client.host if http_request.client else "unknown"
+    if not _rate_limiter.allow(identity):
+        raise HTTPException(
+            status_code=429,
+            detail="게이트웨이 레이트리밋 초과 (RATE_LIMIT_RPM)",
+            headers={"Retry-After": str(_rate_limiter.seconds_until_reset())},
+        )
+
+
+def require_auth(
+    http_request: Request, authorization: Optional[str] = Header(default=None)
+) -> None:
+    """
+    게이트웨이 공유 토큰 검증 + 레이트리밋. `GATEWAY_API_KEY`가 설정된 경우에만
+    인증을 강제한다(쉼표 구분 복수 키 허용). 미설정(빈 값)이면 인증은 통과하되
+    레이트리밋은 IP 단위로 여전히 적용된다. 외부 노출 시엔 반드시 키를 설정할 것.
+    """
+    keys = _gateway_keys()
+    token: Optional[str] = None
+    if keys:
+        if authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        token = authorization[len("Bearer ") :]
+        if not _token_matches(token, keys):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    _enforce_rate_limit(http_request, token)
 
 
 def ws_authorized(websocket: WebSocket) -> bool:
     """
-    WebSocket(/v1/realtime) 공유 토큰 검증. `GATEWAY_API_KEY` 미설정이면 통과.
+    WebSocket(/v1/realtime) 공유 토큰 검증. 키 미설정이면 통과(복수 키 허용).
     브라우저 WS는 커스텀 헤더를 못 붙이므로, `Authorization: Bearer` 헤더 또는
     `?api_key=` 쿼리 파라미터 둘 다 허용한다. 상수 시간 비교 사용.
+    (레이트리밋은 요청 단위 개념이라 지속 연결인 WS에는 적용하지 않는다.)
     """
-    if not settings.gateway_api_key:
+    keys = _gateway_keys()
+    if not keys:
         return True
     authorization = websocket.headers.get("authorization")
-    if authorization and secrets.compare_digest(
-        authorization, f"Bearer {settings.gateway_api_key}"
+    if authorization and authorization.startswith("Bearer ") and _token_matches(
+        authorization[len("Bearer ") :], keys
     ):
         return True
     token = websocket.query_params.get("api_key")
-    if token and secrets.compare_digest(token, settings.gateway_api_key):
+    if token and _token_matches(token, keys):
         return True
     return False
 
@@ -84,21 +144,23 @@ def _extract_native_token(http_request: Request) -> Optional[str]:
 
 def require_native_auth(http_request: Request) -> None:
     """
-    네이티브 엔드포인트(/v1/messages, generateContent) 공유 토큰 검증.
-    `GATEWAY_API_KEY` 미설정이면 통과. 설정 시 위 여러 헤더/쿼리 중 하나로 일치해야 한다.
-    상수 시간 비교 사용.
+    네이티브 엔드포인트(/v1/messages, generateContent) 공유 토큰 검증 + 레이트리밋.
+    `GATEWAY_API_KEY` 미설정이면 인증 통과(레이트리밋은 IP 단위 적용). 설정 시
+    위 여러 헤더/쿼리 중 하나로 일치해야 한다(쉼표 구분 복수 키 허용, 상수 시간 비교).
     """
-    if not settings.gateway_api_key:
-        return
+    keys = _gateway_keys()
     token = _extract_native_token(http_request)
-    if token is None or not secrets.compare_digest(token, settings.gateway_api_key):
+    if keys and (token is None or not _token_matches(token, keys)):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    _enforce_rate_limit(http_request, token if keys else None)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 시작: provider 풀 생성 (client를 1회 만들어 재사용)
     app.state.pool = ProviderPool()
+    # 응답 캐시 (exact-match TTL — 무료 티어 쿼터 절약. TTL 0이면 비활성)
+    app.state.cache = ResponseCache(settings.cache_ttl_seconds)
     yield
     # 종료: 보유한 client 정리
     await app.state.pool.aclose()
@@ -173,6 +235,10 @@ async def list_models(_auth: None = Depends(require_auth)) -> dict:
         {"id": name, "object": "model", "provider": spec.provider}
         for name, spec in MODELS.items()
     ]
+    data += [
+        {"id": name, "object": "model", "provider": spec.provider, "type": "embedding"}
+        for name, spec in EMBEDDING_MODELS.items()
+    ]
     return {"object": "list", "data": data}
 
 
@@ -220,6 +286,20 @@ async def chat_completions(
 ) -> dict | StreamingResponse:
     """OpenAI 호환 chat completions 엔드포인트"""
     pool: ProviderPool = app.state.pool
+    cache: ResponseCache = app.state.cache
+
+    # 응답 캐시 — 비스트리밍 + temperature 미지정/0 인 동일 요청만 대상(cache_key_for).
+    # 히트 시 업스트림 무호출 → 무료 티어 쿼터 절약. 절약분은 'cache' 라벨로 /v1/usage에 집계.
+    cache_key = cache_key_for(request) if cache.enabled else None
+    if cache_key:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            pool.usage.record_success("cache", cached, False)
+            return JSONResponse(content=cached, headers={
+                "x-llm-route": f"requested={request.model}; served=cache",
+                "x-llm-cache": "hit",
+            })
+
     decision = route(request)  # auto면 요청 특성 기반 선택, 그 외엔 이름 기반
     # 실제로 어떤 모델이 응답했는지 관측용 트레이스. 응답 본문은 OpenAI 형식 그대로 두고
     # (호출 측 SDK 호환 유지), 라우팅 결과는 x-llm-route 헤더로만 노출한다.
@@ -230,9 +310,38 @@ async def chat_completions(
             gen = stream_with_fallback(request, decision, pool, trace)
             return await _streaming_response(gen, trace)
         body = await chat_with_fallback(request, decision, pool, trace)
-        return JSONResponse(content=body, headers={"x-llm-route": trace.header()})
+        headers = {"x-llm-route": trace.header()}
+        if cache_key:
+            cache.put(cache_key, body)
+            headers["x-llm-cache"] = "miss"
+        return JSONResponse(content=body, headers=headers)
     except Exception as e:
         # 업스트림/입력 오류의 원래 상태 + 본문(실제 사유)을 그대로 노출 (모두 500으로 뭉개지 않음)
+        raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
+
+
+@app.post("/v1/embeddings")
+async def embeddings(
+    request: EmbeddingsRequest,
+    _auth: None = Depends(require_auth),
+) -> JSONResponse:
+    """
+    OpenAI 호환 embeddings 엔드포인트 (RAG 에이전트용). Gemini embedding(무료) 우선,
+    장애·키 미설정 시 로컬 Ollama로 폴백 — chat과 동일한 fallback 루프(회로차단기·
+    x-llm-route·사용량 집계 포함)를 재사용한다. Anthropic은 임베딩 API가 없어 제외.
+    OpenAI SDK 기본 모델명(text-embedding-3-*)은 별칭으로 기본 모델에 매핑된다.
+    """
+    pool: ProviderPool = app.state.pool
+    decision = resolve_embedding(request.model)
+    trace = RouteTrace(requested=request.model, reason=decision.reason)
+
+    async def invoke(spec: ModelSpec) -> dict:
+        return await pool.get(spec.provider).embed(request, spec)
+
+    try:
+        body = await run_chat_fallback(decision, pool, trace, invoke)
+        return JSONResponse(content=body, headers={"x-llm-route": trace.header()})
+    except Exception as e:
         raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
 
 

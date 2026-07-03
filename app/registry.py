@@ -23,6 +23,9 @@ class ModelSpec:
     # ── capability 메타 (Phase 2: auto 라우트의 후보 필터 근거) ──
     supports_tools: bool = True                # function calling(도구) 지원 여부
     context_window: int = 32_000               # 최대 입력 컨텍스트(토큰). 보수적 기본값
+    # 이미지 입력(vision) 지원 여부. 보수적 기본 False — 미지원 모델에 이미지가 가면
+    # 조용히 무시되거나 400이 나므로, 확실한 모델만 True로 지정한다(Phase 5).
+    supports_vision: bool = False
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,7 @@ MODELS: dict[str, ModelSpec] = {
         is_free=True,
         supports_tools=True,
         context_window=1_000_000,
+        supports_vision=True,
     ),
     "gemini-2.5-flash-lite": ModelSpec(
         provider="gemini",
@@ -55,6 +59,7 @@ MODELS: dict[str, ModelSpec] = {
         is_free=True,
         supports_tools=True,
         context_window=1_000_000,
+        supports_vision=True,
     ),
     # ── Anthropic ───────────────────────────────────────────────
     "claude-sonnet-4-6": ModelSpec(
@@ -66,6 +71,7 @@ MODELS: dict[str, ModelSpec] = {
         is_free=False,
         supports_tools=True,
         context_window=200_000,
+        supports_vision=True,
     ),
     "claude-opus-4-7": ModelSpec(
         provider="anthropic",
@@ -76,6 +82,7 @@ MODELS: dict[str, ModelSpec] = {
         is_free=False,
         supports_tools=True,
         context_window=200_000,
+        supports_vision=True,
     ),
     # ── Ollama (로컬) ────────────────────────────────────────────
     # 서버에 실제 pull된 모델만 등록한다. qwen3.6:27b는 미설치(404)라 제거함.
@@ -101,6 +108,31 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 # 계정/대시보드에서 사용 가능한 정확한 id로 교체할 것.
 LIVE_ALIASES: dict[str, str] = {
     "gemini-live": "gemini-2.5-flash-native-audio-preview-09-2025",
+}
+
+# ── Embeddings 모델 (Phase 5 — /v1/embeddings) ──────────────
+# chat 모델(MODELS)과 별개의 임베딩 전용 모델군. Anthropic은 임베딩 API가 없어 제외.
+# ollama/nomic-embed-text 는 서버에 `ollama pull nomic-embed-text` 필요(README 배포 절 참고).
+EMBEDDING_MODELS: dict[str, ModelSpec] = {
+    "gemini-embedding-001": ModelSpec(
+        provider="gemini",
+        upstream="gemini-embedding-001",
+        fallback=["ollama/nomic-embed-text"],   # 키 미설정/장애 시 로컬로 폴백
+        cost_tier="free-cloud",
+        is_free=True,
+    ),
+    "ollama/nomic-embed-text": ModelSpec(
+        provider="ollama", upstream="nomic-embed-text",
+    ),
+}
+
+DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
+
+# OpenAI SDK 기본 모델명을 그대로 받아주기 위한 별칭 — 클라이언트 코드 수정 없이 연동.
+EMBED_ALIASES: dict[str, str] = {
+    "embed": DEFAULT_EMBEDDING_MODEL,
+    "text-embedding-3-small": DEFAULT_EMBEDDING_MODEL,
+    "text-embedding-3-large": DEFAULT_EMBEDDING_MODEL,
 }
 
 # ── auto 라우트 (Phase 2~4) ─────────────────────────────────
@@ -151,6 +183,8 @@ if DEFAULT_MODEL not in MODELS:
 for _name in {n for names in AUTO_CANDIDATES_BY_TIER.values() for n in names}:
     if _name not in MODELS:
         raise ValueError(f"AUTO 후보 '{_name}' 가 MODELS에 없습니다")
+if DEFAULT_EMBEDDING_MODEL not in EMBEDDING_MODELS:
+    raise ValueError(f"DEFAULT_EMBEDDING_MODEL '{DEFAULT_EMBEDDING_MODEL}' 가 EMBEDDING_MODELS에 없습니다")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -168,22 +202,25 @@ def _passthrough_spec(model: str) -> ModelSpec | None:
     if model.startswith("anthropic/"):
         return ModelSpec(
             provider="anthropic", upstream=model.removeprefix("anthropic/"),
-            cost_tier="paid", is_free=False,
+            cost_tier="paid", is_free=False, supports_vision=True,
         )
     if model.startswith("gemini/"):
         return ModelSpec(
             provider="gemini", upstream=model.removeprefix("gemini/"),
             cost_tier="free-cloud", is_free=True, context_window=1_000_000,
+            supports_vision=True,
         )
     if model.startswith("claude-"):
         return ModelSpec(
             provider="anthropic", upstream=model,
             cost_tier="paid", is_free=False, context_window=200_000,
+            supports_vision=True,
         )
     if model.startswith("gemini-"):
         return ModelSpec(
             provider="gemini", upstream=model,
             cost_tier="free-cloud", is_free=True, context_window=1_000_000,
+            supports_vision=True,
         )
     if ":" in model:
         return ModelSpec(provider="ollama", upstream=model)
@@ -247,6 +284,22 @@ def _usable_context(spec: ModelSpec) -> int:
     return int(spec.context_window * _CONTEXT_SAFETY_RATIO)
 
 
+def _has_images(request: ChatCompletionRequest) -> bool:
+    """
+    요청에 이미지 입력이 있는지 감지한다(Phase 5: vision capability 필터 근거).
+    내부표준은 OpenAI 포맷이므로 `image_url` 파트만 보면 된다 — 네이티브 어댑터가
+    Anthropic `image` 블록·Gemini `inlineData`를 이미 `image_url`로 변환해 들어온다.
+    """
+    for message in request.messages:
+        content = message.content
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
+
+
 def _classify_tier(request: ChatCompletionRequest, estimated_tokens: int) -> str:
     """
     요청 티어를 'long' | 'complex' | 'simple'로 분류한다(추가 LLM 호출 없는 휴리스틱).
@@ -284,6 +337,8 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
       1. 입력 크기를 1회 추정하고 티어(simple/complex/long)에 맞는 후보 셋을 고른다
       2. 후보를 요청 특성으로 필터링한다
          - 도구를 쓰는 요청인데 도구 미지원 모델 → 제외
+         - 이미지가 있는 요청인데 vision 미지원 모델 → 제외 (Phase 5 — 이미지가
+           qwen3 같은 텍스트 전용 로컬로 폴백돼 조용히 무시되는 것을 방지)
          - '추정 입력 + 요청 출력(max_tokens)'이 usable 컨텍스트(안전 마진 반영)를
            초과하는 모델 → 제외 (로컬은 입력·출력이 한 창을 나눠 쓰므로 출력분 포함)
       3. 살아남은 후보를 비용·품질 우선순위(정의된 순서) 그대로 체인으로 만든다
@@ -295,6 +350,7 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
     estimated_tokens = _estimate_tokens(request)
     tier = _classify_tier(request, estimated_tokens)
     needs_tools = bool(request.tools)
+    needs_vision = _has_images(request)
     # 출력 예산까지 포함한 필요 토큰. max_tokens 미지정이면 입력만으로 판단
     # (출력 여유분은 _CONTEXT_SAFETY_RATIO 마진이 흡수한다).
     required_tokens = estimated_tokens + (request.max_tokens or 0)
@@ -302,18 +358,50 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
     candidates = [MODELS[name] for name in AUTO_CANDIDATES_BY_TIER[tier]]
     if needs_tools:
         candidates = [spec for spec in candidates if spec.supports_tools]
+    if needs_vision:
+        candidates = [spec for spec in candidates if spec.supports_vision]
 
     chain = [spec for spec in candidates if required_tokens <= _usable_context(spec)]
     reason = f"auto:tier={tier},est={estimated_tokens}"
+    if needs_vision:
+        reason += ",vision=1"
 
     if not chain and candidates:
         # 모든 후보의 창을 넘는 초대형 입력 — 그나마 가장 큰 창으로 best-effort
         chain = [max(candidates, key=lambda spec: spec.context_window)]
         reason += ",overflow=1"
     if not chain:
-        # 도구 필터로도 전원 탈락(현 레지스트리엔 없는 조합) — 최후 폴백
+        # 도구/vision 필터로 전원 탈락(예: 이미지 요청인데 Gemini 후보가 없는 티어) — 최후 폴백
         chain = [MODELS[DEFAULT_MODEL]]
     return RouteDecision(chain=chain, reason=reason)
+
+
+def _embedding_spec_for(model: str) -> ModelSpec | None:
+    """임베딩 모델 키 하나에 대한 spec 조회 (별칭 → 임베딩 레지스트리 → 패스스루)."""
+    model = EMBED_ALIASES.get(model, model)
+    spec = EMBEDDING_MODELS.get(model)
+    if spec is not None:
+        return spec
+    guessed = _passthrough_spec(model)
+    # 임베딩은 OpenAI 호환 /embeddings 를 제공하는 Gemini·Ollama만 지원
+    # (Anthropic은 임베딩 API 자체가 없음 → 잘못 유추된 후보는 버린다)
+    if guessed is not None and guessed.provider in ("gemini", "ollama"):
+        return guessed
+    return None
+
+
+def resolve_embedding(model: str) -> RouteDecision:
+    """
+    임베딩 모델 이름 → RouteDecision. chat의 resolve()와 같은 구조지만
+    EMBEDDING_MODELS/EMBED_ALIASES 를 본다. 미지 모델은 DEFAULT_EMBEDDING_MODEL로.
+    """
+    spec = _embedding_spec_for(model.strip()) or EMBEDDING_MODELS[DEFAULT_EMBEDDING_MODEL]
+    chain = [spec]
+    for fb in spec.fallback:
+        fb_spec = _embedding_spec_for(fb)
+        if fb_spec is not None:
+            chain.append(fb_spec)
+    return RouteDecision(chain=chain)
 
 
 def resolve_live_model(requested: str | None, default: str) -> str:

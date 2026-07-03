@@ -36,6 +36,14 @@ class ProviderUnavailable(Exception):
     """provider가 설정되지 않아(예: API 키 미설정) 사용 불가. fallback 대상으로 취급."""
 
 
+class BudgetExceeded(Exception):
+    """
+    과금(paid) provider 일일 토큰 예산(PAID_DAILY_TOKEN_BUDGET) 초과.
+    폴백 체인에 무료 후보가 있으면 그쪽으로 넘어가고, 없으면 402로 노출된다.
+    에이전트 루프 폭주로 인한 과금 사고를 게이트웨이 수준에서 차단하는 안전판.
+    """
+
+
 # ─────────────────────────────────────────────────────────────
 # 회로차단기 — provider별 일시 장애를 기억해 쿨다운 동안 뒤로 미룬다
 # ─────────────────────────────────────────────────────────────
@@ -194,6 +202,18 @@ def _error_kind(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _over_paid_budget(spec: ModelSpec, pool: "ProviderPool") -> bool:
+    """
+    이 후보가 과금 모델인데 오늘(UTC)의 과금 토큰 예산을 이미 소진했는지 판단.
+    무료 후보는 항상 통과. 예산 0 이하(무제한)면 비활성.
+    한계: 스트리밍 응답은 토큰이 집계되지 않아 예산 소모로 잡히지 않는다(usage.py 참고).
+    """
+    budget = settings.paid_daily_token_budget
+    if budget <= 0 or spec.is_free:
+        return False
+    return pool.usage.paid_tokens_today() >= budget
+
+
 def _is_retryable(exc: Exception) -> bool:
     """다음 fallback 후보로 넘어갈 만한 에러인지 판단."""
     # 연결 실패 / 타임아웃 계열
@@ -292,6 +312,8 @@ def http_status_for(exc: Exception) -> int:
     """예외를 클라이언트에 돌려줄 HTTP 상태로 매핑 (기본 500). 원인을 그대로 노출."""
     if isinstance(exc, ProviderUnavailable):
         return 503
+    if isinstance(exc, BudgetExceeded):
+        return 402  # Payment Required — 과금 예산 소진
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     if isinstance(exc, anthropic.APIStatusError):
@@ -340,6 +362,15 @@ async def run_chat_fallback(
     last_exc: Exception | None = None
     for idx, spec in enumerate(ordered):
         label = _spec_label(spec)
+        if _over_paid_budget(spec, pool):
+            last_exc = BudgetExceeded(
+                f"과금 일일 토큰 예산({settings.paid_daily_token_budget}) 소진 — {label} 건너뜀"
+            )
+            pool.usage.record_error(label, "budget")
+            if trace is not None:
+                trace.attempts.append(f"{label}#budget")
+            logger.warning("[route] %s 과금 예산 소진 → 건너뜀", label)
+            continue
         try:
             result = await invoke(spec)
         except ProviderUnavailable as e:
@@ -364,7 +395,7 @@ async def run_chat_fallback(
         # 성공
         breaker.record_success(spec.provider)
         fell_back = idx > 0 or bool(deferred)
-        pool.usage.record_success(label, result, fell_back)
+        pool.usage.record_success(label, result, fell_back, is_free=spec.is_free)
         if trace is not None:
             trace.served = label
             trace.fell_back = fell_back
@@ -396,6 +427,15 @@ async def run_stream_fallback(
     last_exc: Exception | None = None
     for idx, spec in enumerate(ordered):
         label = _spec_label(spec)
+        if _over_paid_budget(spec, pool):
+            last_exc = BudgetExceeded(
+                f"과금 일일 토큰 예산({settings.paid_daily_token_budget}) 소진 — {label} 건너뜀"
+            )
+            pool.usage.record_error(label, "budget")
+            if trace is not None:
+                trace.attempts.append(f"{label}#budget")
+            logger.warning("[route] %s 과금 예산 소진 → 건너뜀", label)
+            continue
         try:
             gen = open_stream(spec)  # pool.get 등에서 ProviderUnavailable 가능
         except ProviderUnavailable as e:

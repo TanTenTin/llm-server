@@ -1,9 +1,9 @@
 import httpx
 from typing import AsyncGenerator
 
-from app.models import ChatCompletionRequest
+from app.models import ChatCompletionRequest, EmbeddingsRequest
 from app.providers.base import LLMProvider
-from app.providers.openai_payload import build_openai_payload
+from app.providers.openai_payload import build_embeddings_payload, build_openai_payload
 from app.registry import ModelSpec
 
 # Gemini는 OpenAI 호환 엔드포인트를 제공함.
@@ -57,6 +57,14 @@ class GeminiProvider(LLMProvider):
             async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     yield line + "\n\n"
+
+    async def embed(self, request: EmbeddingsRequest, spec: ModelSpec) -> dict:
+        """Gemini OpenAI 호환 /embeddings 프록시 (chat과 같은 client·인증 재사용)."""
+        response = await self.client.post(
+            "/embeddings", json=build_embeddings_payload(request, spec)
+        )
+        response.raise_for_status()
+        return response.json()
 
     # ── 네이티브 패스스루 (/v1beta/models/{model}:generateContent → Gemini) ──────
     # OpenAI-compat 이중 변환을 건너뛰고 클라이언트의 Gemini 요청 body를 그대로 네이티브

@@ -21,12 +21,14 @@
 
 ```
 app/
-├── main.py        — 엔드포인트 + lifespan(풀 생성/정리): POST /v1/chat/completions(OpenAI), POST /v1/messages(Anthropic 네이티브), POST /v1beta/models/{model}:generateContent·:streamGenerateContent(Gemini 네이티브), GET /v1/models, GET /v1/usage(사용량 집계), GET /health(무인증)·/health/providers(심층: 등록/breaker/Ollama 프로브), WS /v1/realtime
-├── config.py      — Settings (GOOGLE_AI_API_KEY, ANTHROPIC_API_KEY, OLLAMA_BASE_URL, GATEWAY_API_KEY, BREAKER_COOLDOWN_SECONDS, REALTIME_*)
-├── models.py      — ChatCompletionRequest 등 OpenAI 호환 Pydantic 모델 (내부표준 canonical 포맷)
-├── registry.py    — 라우팅 결정: ModelSpec(+cost_tier/is_free 메타) / RouteDecision / MODELS / ALIASES / DEFAULT_MODEL / resolve() / LIVE_ALIASES·resolve_live_model()
-├── service.py     — ProviderPool(인스턴스 재사용) + CircuitBreaker(동적 쿨다운) + RouteTrace + fallback 실행 + 에러 분류 + retry_after_seconds(Retry-After/RetryInfo 파싱)
-├── usage.py       — UsageTracker: provider:model × UTC 일 단위 요청/토큰/에러 인메모리 집계(7일 보존, 단일 프로세스 전제). OpenAI·Anthropic·Gemini 3종 usage 필드 정규화. /v1/usage로 노출
+├── main.py        — 엔드포인트 + lifespan(풀·캐시 생성/정리): POST /v1/chat/completions(OpenAI)·/v1/embeddings, POST /v1/messages(Anthropic 네이티브), POST /v1beta/models/{model}:generateContent·:streamGenerateContent(Gemini 네이티브), GET /v1/models, GET /v1/usage(사용량 집계), GET /health(무인증)·/health/providers(심층: 등록/breaker/Ollama 프로브), WS /v1/realtime. 인증(_gateway_keys 쉼표 구분 복수 키)·레이트리밋(_enforce_rate_limit)도 여기
+├── config.py      — Settings (GOOGLE_AI_API_KEY, ANTHROPIC_API_KEY, OLLAMA_BASE_URL, GATEWAY_API_KEY(복수 키), BREAKER_COOLDOWN_SECONDS, CACHE_TTL_SECONDS, PAID_DAILY_TOKEN_BUDGET, RATE_LIMIT_RPM, REALTIME_*)
+├── models.py      — ChatCompletionRequest·EmbeddingsRequest 등 OpenAI 호환 Pydantic 모델 (내부표준 canonical 포맷)
+├── registry.py    — 라우팅 결정: ModelSpec(+cost_tier/is_free/supports_vision 메타) / RouteDecision / MODELS / ALIASES / DEFAULT_MODEL / resolve() / EMBEDDING_MODELS·EMBED_ALIASES·resolve_embedding() / LIVE_ALIASES·resolve_live_model()
+├── service.py     — ProviderPool(인스턴스 재사용) + CircuitBreaker(동적 쿨다운) + RouteTrace + fallback 실행 + 에러 분류 + retry_after_seconds(Retry-After/RetryInfo 파싱) + 과금 예산 가드(_over_paid_budget→BudgetExceeded=402)
+├── usage.py       — UsageTracker: provider:model × UTC 일 단위 요청/토큰/에러 인메모리 집계(7일 보존, 단일 프로세스 전제). OpenAI·Anthropic·Gemini 3종 usage 필드 정규화 + paid_tokens_today()(예산 가드 근거). /v1/usage로 노출
+├── cache.py       — ResponseCache: exact-match(요청 전체 sha256) + TTL + LRU(256). 비스트리밍·temperature 미지정/0만 대상(cache_key_for). 히트는 usage에 "cache" 라벨 집계, x-llm-cache 헤더
+├── ratelimit.py   — RateLimiter: 분 단위 고정 윈도우 RPM 제한(키 해시 또는 IP). RATE_LIMIT_RPM=0 비활성
 ├── realtime.py    — /v1/realtime 음성 브리지: OpenAI Realtime 이벤트 ↔ Gemini Live(네이티브 WSS) 양방향 중계 (RealtimeBridge)
 ├── audio.py       — PCM16 리샘플러(resample_pcm16): 클라 입력 24kHz → Gemini 16kHz (순수 파이썬, 의존성 0)
 ├── adapters/      — 네이티브 입력 포맷 어댑터 (edge에서 네이티브 ⇄ OpenAI 내부표준 변환만 담당, 라우팅은 기존 파이프라인 재사용)
@@ -85,7 +87,7 @@ POST /v1/chat/completions
   - **long이 난이도보다 우선(Phase 4)**: `_estimate_tokens` ≥ `_LONG_INPUT_THRESHOLD(25_000)` → long. 후보 [gemini-2.5-flash, gemini-2.5-flash-lite] (둘 다 1M 컨텍스트, 로컬 32k는 어차피 필터 탈락이라 미포함).
   - complex 조건(하나라도): `tools` 사용 / 추정 토큰 ≥ `_COMPLEX_TOKEN_THRESHOLD(1200)` / 메시지 수 ≥ `_COMPLEX_MESSAGE_COUNT(6)` / 사용자 메시지에 `_COMPLEX_KEYWORDS` 포함.
   - simple → [gemini-2.5-flash-lite, ollama/qwen3:14b] / complex → [gemini-2.5-flash, ollama/qwen3:14b]. 모든 티어 무료만, **과금(Claude) 미포함**(비용 0 보장).
-- **capability 필터(Phase 2·4)**: `tools` 있는데 `supports_tools=False`면 제외. 컨텍스트는 `추정 입력 + request.max_tokens(출력 예산)` > `_usable_context(spec)`(= `context_window` × `_CONTEXT_SAFETY_RATIO(0.8)`)이면 제외 — 추정 오차 + 로컬의 입력·출력 공유 창을 흡수하는 안전 마진.
+- **capability 필터(Phase 2·4·5)**: `tools` 있는데 `supports_tools=False`면 제외. 이미지(`image_url` 파트, `_has_images`) 있는데 `supports_vision=False`면 제외(reason에 `,vision=1`) — 네이티브 어댑터가 Anthropic `image`/Gemini `inlineData`를 이미 `image_url`로 변환하므로 OpenAI 포맷만 보면 됨. 컨텍스트는 `추정 입력 + request.max_tokens(출력 예산)` > `_usable_context(spec)`(= `context_window` × `_CONTEXT_SAFETY_RATIO(0.8)`)이면 제외 — 추정 오차 + 로컬의 입력·출력 공유 창을 흡수하는 안전 마진.
 - **overflow best-effort(Phase 4)**: 컨텍스트 초과로 전원 탈락 시 후보 중 `context_window` 최대 모델 1개를 시도(reason에 `,overflow=1`). DEFAULT_MODEL 무조건 폴백은 이미 탈락한 모델 재선택이라 폐기. 도구 필터로 전원 탈락하는 경우(현 레지스트리엔 없음)만 DEFAULT_MODEL 최후 폴백.
 - **토큰 추정(`_estimate_tokens`)**: 메시지 content + 멀티턴 `tool_calls`(함수 인자 — 에이전트 대화에서 커짐) + 도구 정의를 문자수÷`_CHARS_PER_TOKEN=3`으로 근사.
 - 선택 사유는 `RouteDecision.reason`("auto:tier=long,est=45000" 형태)으로 실려 `x-llm-route` 헤더에 `reason=`으로 노출. 살아남은 후보가 그대로 체인이 되어 Phase 1 회로차단기·폴백 동일 적용.
@@ -100,7 +102,10 @@ POST /v1/chat/completions
 - **chat_with_fallback / stream_with_fallback**: `RouteDecision.chain`을 순서대로 시도. `ProviderUnavailable` 또는 재시도 가능 에러면 다음 후보로.
 - **CircuitBreaker (Phase 1 + 동적 쿨다운)**: provider별 일시 장애(429/5xx/연결오류)를 기억해 쿨다운 동안 그 provider를 폴백 체인 **뒤로 미룬다**(`_order_by_breaker`). 무료 티어 Gemini가 429로 막히면 잠깐 Ollama를 우선시켜 헛때리는 지연을 제거. 쿨다운 만료 시 자동 복귀(half-open), 성공 시 즉시 닫힘. `ProviderUnavailable`(키 미설정)은 영구 설정 문제라 회로차단 대상이 아님. 단일 프로세스 코루틴 공유 상태(읽기-쓰기 사이 await 없어 락 불필요).
   - **동적 쿨다운**: `record_failure(provider, cooldown_hint)` — fallback 루프가 `retry_after_seconds(exc)`로 업스트림 힌트(표준 `Retry-After` 헤더 → Gemini 429 본문 `RetryInfo.retryDelay` 순)를 파싱해 전달. 힌트가 있으면 기본 `BREAKER_COOLDOWN_SECONDS` 대신 사용(`_MAX_DYNAMIC_COOLDOWN_SECONDS=3600` 클램프 — RPD 소진 같은 장기 대기도 1시간마다 half-open 탐침). 힌트가 기본값보다 짧으면 그대로 신뢰. 쿨다운 0(비활성) 설정은 힌트보다 우선. `status()`로 open 상태 인트로스펙션(/health/providers가 사용).
-- **UsageTracker (usage.py)**: fallback 루프의 성공/실패 지점에서 집계 — 성공 시 `record_success(label, body, fell_back)`(3종 usage 필드 정규화, 스트리밍은 body=None으로 요청 수만), 실패 시 `record_error(label, kind)`(kind는 "429"/"connect"/"unavailable" 등 `_error_kind`). `ProviderPool.usage`에 인스턴스가 살고 `/v1/usage`가 `snapshot()` 노출. 무료 티어 쿼터 관측이 목적이며 이후 예산 가드(P1)의 데이터 기반.
+- **UsageTracker (usage.py)**: fallback 루프의 성공/실패 지점에서 집계 — 성공 시 `record_success(label, body, fell_back, is_free)`(3종 usage 필드 정규화, 스트리밍은 body=None으로 요청 수만, is_free=False면 paid 토큰 별도 적립), 실패 시 `record_error(label, kind)`(kind는 "429"/"connect"/"unavailable"/"budget" 등). `ProviderPool.usage`에 인스턴스가 살고 `/v1/usage`가 `snapshot()` 노출(+`paid_tokens_by_day`). 무료 티어 쿼터 관측 + 예산 가드의 데이터 기반.
+- **과금 예산 가드 (P1)**: fallback 루프가 후보 시도 전 `_over_paid_budget(spec, pool)` 확인 — `PAID_DAILY_TOKEN_BUDGET` > 0이고 `spec.is_free=False`이며 `usage.paid_tokens_today()` ≥ 예산이면 그 후보를 건너뜀(trace `#budget`, usage kind "budget"). 무료 폴백이 없으면 `BudgetExceeded` → 402. 스트리밍은 토큰 미집계라 예산 소모로 안 잡히는 한계 있음.
+- **응답 캐시 (cache.py, P1)**: `/v1/chat/completions` 핸들러에서 fallback 루프 진입 전 조회 — `cache_key_for()`가 비스트리밍+temperature 미지정/0만 키 발급(요청 전체 정렬 JSON sha256). 히트 시 업스트림 무호출, `x-llm-route: served=cache` + `x-llm-cache: hit`, usage에 "cache" 라벨 집계. miss면 성공 응답을 `put`. 네이티브 엔드포인트는 캐시 미적용(패스스루 보존 우선).
+- **레이트리밋 (ratelimit.py, P1)**: `require_auth`/`require_native_auth`가 인증 통과 후 `_enforce_rate_limit` — 키 sha256(앞 16자) 또는 IP 단위 분당 고정 윈도우. 초과 시 429 + `Retry-After`(다음 분까지 남은 초). WS는 지속 연결이라 미적용.
 - **RouteTrace / `x-llm-route` 헤더 (Phase 1)**: 실제로 어떤 후보가 응답했는지 추적해 응답 헤더로 노출(`requested=`/`served=`/`fallback=1`/`deferred=`). 응답 **본문은 OpenAI 형식 그대로** 두므로 호출 측 SDK 호환 유지. silent fallback 관측·로깅(`logger = logging.getLogger("llm_gateway")`)에 사용.
 - **스트리밍 fallback은 첫 청크 전까지만** 가능(이미 바이트를 보낸 뒤엔 불가). 어떤 경로로 끝나든 `aclose_quietly()`로 업스트림 스트림을 정리해 커넥션 누수를 막는다.
 
@@ -113,8 +118,11 @@ POST /v1/chat/completions
 | `GOOGLE_AI_API_KEY` | `""` | Gemini API 키. `gemini-*`(기본 모델) 사용 시 필요. 비면 Gemini 미등록 → 로컬 fallback |
 | `ANTHROPIC_API_KEY` | `""` | Anthropic API 키. `claude-*` 모델 사용 시 필요. 비면 Anthropic 미등록 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소 |
-| `GATEWAY_API_KEY` | `""` | 게이트웨이 공유 인증 토큰. 설정 시 `/v1/*`에 `Authorization: Bearer <키>` 필요 |
-| `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). 일시 장애 provider를 이 시간 동안 폴백 체인 뒤로 미룸. `0` 이하면 비활성화 |
+| `GATEWAY_API_KEY` | `""` | 게이트웨이 인증 토큰(쉼표 구분 복수 키). 설정 시 `/v1/*`에 `Authorization: Bearer <키>` 필요 |
+| `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). 일시 장애 provider를 이 시간 동안 폴백 체인 뒤로 미룸. `0` 이하면 비활성화. Retry-After/RetryInfo 힌트 우선(상한 1시간) |
+| `CACHE_TTL_SECONDS` | `300.0` | 응답 캐시 TTL(초). 비스트리밍+temperature 0/미지정 동일 요청 캐시. `0` 이하면 비활성 |
+| `PAID_DAILY_TOKEN_BUDGET` | `0` | 과금 provider 일일 토큰 예산. 초과 시 유료 후보 건너뜀(무료 폴백 or 402). `0` 무제한 |
+| `RATE_LIMIT_RPM` | `0` | 분당 요청 상한(키별/IP별). 초과 시 429+Retry-After. `0` 무제한 |
 | `REALTIME_DEFAULT_MODEL` | `gemini-2.5-flash-native-audio-preview-09-2025` | `/v1/realtime` 기본 Gemini Live 모델 id(클라가 `?model=` 미지정 시). **계정의 정확한 id로 교체 필요** |
 | `REALTIME_INPUT_SAMPLE_RATE` | `24000` | 클라 입력 PCM16 레이트(Hz). Gemini Live는 16000 요구 → 다르면 16kHz로 리샘플(같으면 건너뜀) |
 
@@ -181,13 +189,14 @@ uvicorn app.main:app --reload          # 개발 (자동 리로드)
 # 운영: uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-- 테스트: `tests/`(pytest — test_passthrough·test_auto_route·test_observability). 실행: `pip install pytest && python -m pytest tests/ -q`. passthrough 보존, auto 라우팅(티어·안전 마진·overflow), 동적 회로 쿨다운(Retry-After/RetryInfo 파싱·클램프), UsageTracker(3종 usage 정규화·에러 집계)를 회귀로 검증. 배포 이미지에는 pytest 미포함(런타임 비대화 방지). **deploy.yml이 pytest 게이트를 통과해야만 배포**(test job → needs: test).
+- 테스트: `tests/`(pytest — test_passthrough·test_auto_route·test_observability·test_p1). 실행: `pip install pytest && python -m pytest tests/ -q`. passthrough 보존, auto 라우팅(티어·안전 마진·overflow·vision), 동적 회로 쿨다운(Retry-After/RetryInfo 파싱·클램프), UsageTracker(3종 usage 정규화·에러 집계), embeddings 라우팅/payload, 응답 캐시(키 조건·LRU), 예산 가드(스킵→폴백/402), 레이트리밋·복수 키를 회귀로 검증. 배포 이미지에는 pytest 미포함(런타임 비대화 방지). **deploy.yml이 pytest 게이트를 통과해야만 배포**(test job → needs: test).
 
 ## 로컬 Ollama 모델
 
 Oracle 서버 (4 OCPU, 24GB RAM) 기준 추천 모델:
 
 ```bash
-ollama pull qwen3:14b       # 속도/품질 균형 (~9GB)
-ollama pull qwen3.6:27b     # 품질 우선 (~17GB)
+ollama pull qwen3:14b           # 속도/품질 균형 (~9GB)
+ollama pull qwen3.6:27b         # 품질 우선 (~17GB)
+ollama pull nomic-embed-text    # /v1/embeddings 로컬 폴백용 (~275MB)
 ```

@@ -1,4 +1,4 @@
-from app.models import ChatCompletionRequest
+from app.models import ChatCompletionRequest, EmbeddingsRequest
 from app.registry import ModelSpec
 
 # OpenAI 호환 업스트림(Gemini·Ollama)으로 '그대로 전달'하는 표준 파라미터 화이트리스트.
@@ -37,4 +37,18 @@ def build_openai_payload(request: ChatCompletionRequest, spec: ModelSpec) -> dic
     if "max_tokens" not in payload and spec.max_tokens is not None:
         payload["max_tokens"] = spec.max_tokens
 
+    return payload
+
+
+# embeddings 요청에서 업스트림으로 전달할 선택 파라미터 (chat과 동일한 화이트리스트 원칙)
+_EMBED_FORWARD_PARAMS = ("dimensions", "encoding_format", "user")
+
+
+def build_embeddings_payload(request: EmbeddingsRequest, spec: ModelSpec) -> dict:
+    """OpenAI 호환 업스트림용 embeddings payload (Gemini·Ollama 공용)."""
+    payload: dict = {"model": spec.upstream, "input": request.input}
+    for key in _EMBED_FORWARD_PARAMS:
+        value = getattr(request, key)
+        if value is not None:
+            payload[key] = value
     return payload
