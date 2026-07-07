@@ -89,6 +89,7 @@ MODELS: dict[str, ModelSpec] = {
     # 추후 'ollama pull qwen3.6:27b' 후 다시 등록하면 fallback/auto 후보로 쓸 수 있다.
     "ollama/qwen3:14b": ModelSpec(
         provider="ollama", upstream="qwen3:14b",
+        fallback=["gemini-2.5-flash"],      # 로컬 장애/과부하 시 Gemini(무료 클라우드)로 폴백
         supports_tools=True, context_window=32_000,
     ),
 }
@@ -99,8 +100,8 @@ ALIASES: dict[str, str] = {
     "smart": "gemini-2.5-flash",
 }
 
-# 기본 모델: GOOGLE_AI_API_KEY 있으면 Gemini, 키 미설정이면 fallback으로 로컬 Ollama
-DEFAULT_MODEL = "gemini-2.5-flash"
+# 기본 모델: 로컬 Ollama(qwen3:14b) 우선. 로컬 장애/과부하 시 fallback으로 Gemini(무료 클라우드).
+DEFAULT_MODEL = "ollama/qwen3:14b"
 
 # ── Realtime(음성) 모델 별칭 ────────────────────────────────
 # /v1/realtime 의 친화적 별칭 → 실제 Gemini Live 모델 id.
