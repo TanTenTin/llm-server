@@ -1,41 +1,22 @@
-# llm-server + Ollama 단일 호스트(Oracle) compose.
+# llm-server 단독 compose (Oracle).
 #
-# - ollama: 모델 추론 엔진. 모델은 ollama_data 볼륨에 영속(컨테이너 재생성에도 유지).
-#           Oracle ARM은 GPU가 없어 CPU 추론. 최초 1회 모델 pull 필요(README 참고).
-# - llm-server: FastAPI 게이트웨이. 내부망(llm-internal)으로 ollama에 접속하고,
-#               호스트 127.0.0.1:8000만 퍼블리시해 같은 호스트의 nginx가 프록시한다.
+# Ollama(로컬-LLM)는 이 호스트가 아니라 "원격 로컬-LLM 서버"를 사용한다.
+# 게이트웨이는 OLLAMA_BASE_URL(서버 .env)로 그 원격 주소에 접속한다.
+# (예: 같은 tailnet의 Tailscale IP → http://100.x.y.z:11434)
 #
-# 인증/시크릿(ANTHROPIC_API_KEY, GATEWAY_API_KEY)은 서버의 ~/llm-server/.env 에 둔다(git 제외).
+# - llm-server: FastAPI 게이트웨이. 호스트 127.0.0.1:8000만 퍼블리시해
+#               같은 호스트의 nginx(+Cloudflare)가 프록시한다.
+#
+# 인증/시크릿/업스트림 주소(ANTHROPIC_API_KEY, GATEWAY_API_KEY, OLLAMA_BASE_URL)는
+# 서버의 ~/llm-server/.env 에 둔다(git 제외).
 name: llm-server
 
 services:
-  ollama:
-    image: ollama/ollama:latest
-    restart: unless-stopped
-    volumes:
-      - ollama_data:/root/.ollama # 받은 모델 영속화 (재기동 시 재다운로드 방지)
-    networks:
-      - llm-internal
-    # 외부 노출 불필요 — llm-server만 내부망으로 접근한다(포트 미퍼블리시).
-
   llm-server:
     build: .
     restart: unless-stopped
     env_file:
-      - .env # ANTHROPIC_API_KEY, GATEWAY_API_KEY 등 (서버에 수동 배치, git 제외)
-    environment:
-      # compose env가 .env보다 우선 → Ollama는 컨테이너명으로 강제(로컬 11434 아님)
-      OLLAMA_BASE_URL: http://ollama:11434
+      - .env # GATEWAY_API_KEY, GOOGLE_AI_API_KEY, ANTHROPIC_API_KEY,
+             # OLLAMA_BASE_URL=http://<원격 로컬-LLM 주소>:11434 등
     ports:
-      - "127.0.0.1:8000:8000" # 로컬만 공개. 외부 노출은 같은 호스트의 nginx(+Cloudflare)가 담당
-    depends_on:
-      - ollama
-    networks:
-      - llm-internal
-
-networks:
-  llm-internal:
-    driver: bridge
-
-volumes:
-  ollama_data:
+      - "127.0.0.1:8000:8000" # 로컬만 공개. 외부 노출은 nginx(+Cloudflare)가 담당
