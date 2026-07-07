@@ -1,7 +1,6 @@
 name: deploy-llm-server
 
-# app/ · 의존성 · Docker · compose 변경 시 Oracle 인스턴스로 동기화하고
-# 컨테이너를 재빌드·기동한다. (Caddy 라우팅은 caddy-config 레포가 별도 관리)
+# app/ · 의존성 · Docker · compose 변경 시 서버가 git pull 후 재빌드·기동한다.
 # 배포 전 pytest 게이트: 테스트가 깨지면 운영에 나가지 않는다.
 on:
   push:
@@ -38,29 +37,16 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.ORACLE_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.ORACLE_HOST }}" >> ~/.ssh/known_hosts
-
-      # 서버의 ~/llm-server 로 동기화. .env는 제외(서버에 수동 배치 → 시크릿 보존).
-      - name: Rsync to server
-        run: |
-          rsync -az --delete \
-            --exclude='.git' \
-            --exclude='.env' \
-            --exclude='.venv' \
-            --exclude='__pycache__' \
-            -e "ssh -i ~/.ssh/deploy_key" \
-            ./ "${{ secrets.ORACLE_USER }}@${{ secrets.ORACLE_HOST }}:~/llm-server/"
-
-      # compose 재빌드 + 기동. (ollama 모델은 최초 1회 수동 pull — README 참고)
-      - name: Deploy
-        run: |
-          ssh -i ~/.ssh/deploy_key "${{ secrets.ORACLE_USER }}@${{ secrets.ORACLE_HOST }}" \
-            'cd ~/llm-server && docker compose up -d --build'
+      # 서버가 직접 git pull 후 재빌드·기동. (.env는 gitignore라 reset --hard가 건드리지 않음)
+      - name: Deploy via git pull
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/llm-server
+            git fetch --prune origin
+            git reset --hard origin/main
+            docker compose up -d --build
