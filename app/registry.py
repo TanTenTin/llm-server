@@ -138,19 +138,20 @@ EMBED_ALIASES: dict[str, str] = {
 
 # ── auto 라우트 (Phase 2~4) ─────────────────────────────────
 # 클라이언트가 model="auto"로 보내면, 게이트웨이가 직접 모델을 고른다.
-# 후보는 '무료'만, 비용·품질 우선순위 순으로 둔다(free-cloud Gemini → 로컬 Ollama).
+# 후보는 '무료'만. 로컬 우선 정책: 로컬 Ollama → free-cloud Gemini 순으로 둔다
+# (로컬 장애·과부하·컨텍스트 초과 시 클라우드로 폴백).
 # 과금(Claude)은 auto에서 자동 선택하지 않는다 — 비용 0 보장. Claude가 필요하면 명시 지정.
 #
 # Phase 3: 요청 난이도(simple/complex)를 먼저 판단해 티어별로 후보 셋을 다르게 쓴다.
-#   simple  → 가볍고 빠른 모델(flash-lite, 14b)   : 인사·단순 질의·짧은 대화
-#   complex → 강한 모델(flash, 로컬은 14b)        : 도구 사용·긴 입력·다중턴·추론성 키워드
+#   simple  → 로컬 qwen3:14b 우선, 폴백 flash-lite   : 인사·단순 질의·짧은 대화
+#   complex → 로컬 qwen3:14b 우선, 폴백 flash        : 도구 사용·긴 입력·다중턴·추론성 키워드
 # Phase 4: 대용량 컨텍스트 전용 'long' 티어. 추정 입력이 로컬 usable 창을 넘으면
 #   난이도와 무관하게 1M 컨텍스트 Gemini로 직행한다(로컬 32k는 어차피 필터에서 탈락).
 AUTO_ROUTE = "auto"
 AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
-    "simple": ["gemini-2.5-flash-lite", "ollama/qwen3:14b"],
-    "complex": ["gemini-2.5-flash", "ollama/qwen3:14b"],
-    "long": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+    "simple": ["ollama/qwen3:14b", "gemini-2.5-flash-lite"],
+    "complex": ["ollama/qwen3:14b", "gemini-2.5-flash"],
+    "long": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],   # 대용량 입력은 로컬 32k 불가 → 클라우드
 }
 
 # 토큰 추정 계수: char 수 → 대략의 토큰 수(한글/혼합 보수적으로 3 chars/token 가정).

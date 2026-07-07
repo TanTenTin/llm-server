@@ -34,18 +34,20 @@ def _text_of_tokens(tokens: int) -> str:
     return "a" * (tokens * _CHARS_PER_TOKEN)
 
 
-def test_simple_short_query_uses_lite_tier():
+def test_simple_short_query_prefers_local():
     decision = route(_req("hi"))
     assert decision.reason.startswith("auto:tier=simple")
-    assert decision.chain[0].upstream == "gemini-2.5-flash-lite"
-    # 로컬 폴백이 체인에 남아 있어야 함
-    assert any(spec.provider == "ollama" for spec in decision.chain)
+    # 로컬 우선 정책: 로컬(qwen3)이 primary, Gemini(flash-lite)가 폴백으로 남는다
+    assert decision.chain[0].provider == "ollama"
+    assert any(spec.provider == "gemini" for spec in decision.chain)
 
 
 def test_tools_request_classified_complex():
     decision = route(_req("read x", tools=[{"type": "function", "function": {"name": "read"}}]))
     assert decision.reason.startswith("auto:tier=complex")
-    assert decision.chain[0].upstream == "gemini-2.5-flash"
+    # complex 도 로컬 우선 — qwen3는 tools 지원이라 primary로 남고 Gemini가 폴백
+    assert decision.chain[0].provider == "ollama"
+    assert any(spec.provider == "gemini" for spec in decision.chain)
 
 
 def test_long_input_routes_to_big_context_only():
