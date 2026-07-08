@@ -8,6 +8,16 @@ class Settings(BaseSettings):
     google_ai_api_key: str = ""
     # Ollama가 뜨는 주소. 온프레미스 서버 주소로 변경 가능
     ollama_base_url: str = "http://localhost:11434"
+    # Ollama 요청 컨텍스트 창(num_ctx, 토큰). 0 이하면 미지정(=Ollama 서버 기본, 보통 2~4k).
+    # OpenAI 호환 엔드포인트는 num_ctx를 못 받으므로 게이트웨이는 네이티브 /api/chat 경로로
+    # 이 값을 주입한다 — 코딩 에이전트의 큰 시스템 프롬프트·도구 정의가 잘리는 것을 막는다.
+    # 원격 Ollama 호스트에 OLLAMA_CONTEXT_LENGTH env를 함께 두면 서버 기본값도 올라간다.
+    ollama_num_ctx: int = 16384
+    # qwen3 등 '사고(thinking)' 모델의 내부 reasoning을 기본 비활성화할지 여부.
+    # True면 요청이 think를 명시하지 않았고 업스트림이 thinking 계열 모델일 때 think=False를
+    # 보낸다 — 에이전트 요청에서 reasoning이 출력 예산을 다 써 content가 비는 문제를 막는다.
+    # thinking 미지원 모델(gemma 등)엔 보내지 않으며, 그래도 400이 나면 think 없이 자동 재시도한다.
+    ollama_disable_think: bool = True
     # 게이트웨이 공유 인증 토큰. 설정 시 /v1/* 요청에 'Authorization: Bearer <키>' 필요.
     # 비우면 인증 없이 개방 → 외부(llm.tan-kim.com) 노출 시 반드시 설정할 것.
     gateway_api_key: str = ""
