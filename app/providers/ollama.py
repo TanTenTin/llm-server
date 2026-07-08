@@ -307,6 +307,16 @@ class OllamaProvider(LLMProvider):
                     "model": spec.upstream,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
                 }
+                # 마지막(done) 청크에 usage를 실어 게이트웨이가 스트리밍 토큰을 집계하게 한다
+                # (E-01 — OpenAI 스트리밍 usage 청크 관례. 로컬은 무료라 관측 목적).
+                if done:
+                    prompt_tokens = chunk.get("prompt_eval_count", 0)
+                    completion_tokens = chunk.get("eval_count", 0)
+                    sse["usage"] = {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    }
                 yield f"data: {json.dumps(sse)}\n\n"
             yield "data: [DONE]\n\n"
         finally:

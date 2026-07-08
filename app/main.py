@@ -29,6 +29,7 @@ from app.registry import (
     RouteDecision,
     resolve_embedding,
     route,
+    update_ollama_capabilities,
 )
 from app.service import (
     ProviderPool,
@@ -162,6 +163,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.pool = ProviderPool()
     # 응답 캐시 (exact-match TTL — 무료 티어 쿼터 절약. TTL 0이면 비활성)
     app.state.cache = ResponseCache(settings.cache_ttl_seconds)
+    # (E-03) Ollama capability 캐시 워밍업 — 패스스루 라우팅이 실제 모델 특성(tools/vision)을
+    # 반영하도록 시작 시 1회 조회한다. 실패해도 기동엔 지장 없고(빈 캐시=보수적 기본),
+    # 이후 /v1/models 조회 때마다 최신으로 갱신된다.
+    try:
+        provider = app.state.pool.get("ollama")
+        if isinstance(provider, OllamaProvider):
+            update_ollama_capabilities(await provider.list_models())
+    except Exception:
+        pass
     yield
     # 종료: 보유한 client 정리
     await app.state.pool.aclose()
@@ -244,6 +254,10 @@ async def _ollama_models(pool: ProviderPool) -> list[dict]:
             for name, spec in {**MODELS, **EMBEDDING_MODELS}.items()
             if spec.provider == "ollama"
         ]
+
+    # (E-03) 실시간 조회 결과로 라우팅용 capability 캐시를 갱신 — pull/rm으로 로컬 모델이
+    # 바뀌면 패스스루 라우팅의 tools/vision 판단도 재기동 없이 따라간다.
+    update_ollama_capabilities(models)
 
     entries: list[dict] = []
     for model in models:

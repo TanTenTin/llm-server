@@ -15,7 +15,7 @@ from app.providers.base import LLMProvider
 from app.providers.gemini import GeminiProvider
 from app.providers.ollama import OllamaProvider
 from app.registry import ModelSpec, RouteDecision
-from app.usage import UsageTracker
+from app.usage import UsageTracker, sniff_stream_usage
 
 # fallback을 유발하는 HTTP 상태 (provider가 일시적으로/구조적으로 못 받는 상황)
 #   404: 모델 미로드 · 408/409/429: 일시 과부하 · 5xx: provider 내부 오류
@@ -473,22 +473,30 @@ async def run_stream_fallback(
             )
             continue
 
-        # 첫 청크 확보 — 이후엔 fallback 없이 끝까지 흘려보내되 항상 정리
-        # (스트리밍은 토큰 집계 없이 요청 수만 센다 — usage.py 모듈 설명 참고)
+        # 첫 청크 확보 — 이후엔 fallback 없이 끝까지 흘려보내되 항상 정리.
+        # 요청 수는 여기서 집계하고, 토큰은 스트림을 흘려보내며 usage 청크를 sniff해
+        # 종료 시점에 반영한다(E-01 — 예산 가드/관측이 스트리밍을 실명하지 않도록).
         breaker.record_success(spec.provider)
         fell_back = idx > 0 or bool(deferred)
-        pool.usage.record_success(label, None, fell_back)
+        pool.usage.record_success(label, None, fell_back, is_free=spec.is_free)
         if trace is not None:
             trace.served = label
             trace.fell_back = fell_back
             trace.attempts.append(f"{label}#ok")
         logger.info("[route] 스트림=%s (fallback=%s)", label, fell_back)
+        usage_acc: dict = {}
+        sniff_stream_usage(first, usage_acc)
         try:
             yield first
             async for chunk in gen:
+                sniff_stream_usage(chunk, usage_acc)
                 yield chunk
         finally:
             await aclose_quietly(gen)
+            pool.usage.record_stream_tokens(
+                label, usage_acc.get("prompt", 0), usage_acc.get("completion", 0),
+                is_free=spec.is_free,
+            )
         return
 
     raise last_exc if last_exc is not None else RuntimeError("라우팅 후보가 없습니다")

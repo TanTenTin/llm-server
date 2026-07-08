@@ -12,7 +12,13 @@ class Settings(BaseSettings):
     # OpenAI 호환 엔드포인트는 num_ctx를 못 받으므로 게이트웨이는 네이티브 /api/chat 경로로
     # 이 값을 주입한다 — 코딩 에이전트의 큰 시스템 프롬프트·도구 정의가 잘리는 것을 막는다.
     # 원격 Ollama 호스트에 OLLAMA_CONTEXT_LENGTH env를 함께 두면 서버 기본값도 올라간다.
-    ollama_num_ctx: int = 16384
+    #
+    # (E-02) 이 값이 라우터의 로컬 컨텍스트 판단의 '단일 소스'다 — registry가 ollama 모델의
+    # context_window를 이 값에서 파생시킨다(예전엔 registry에 32_000이 하드코딩돼 있어 런타임
+    # 16384와 어긋나 조용한 잘림이 났다). 기본값을 32768로 두어 로컬 우선 라우팅 범위를
+    # 유지한다. 서버 RAM 한도에 맞춰 .env에서 조정 가능 — 낮추면 라우터가 자동으로 보수적으로
+    # 판단하므로(=큰 입력은 클라우드로) 값을 바꿔도 잘림 위험이 생기지 않는다.
+    ollama_num_ctx: int = 32768
     # qwen3 등 '사고(thinking)' 모델의 내부 reasoning을 기본 비활성화할지 여부.
     # True면 요청이 think를 명시하지 않았고 업스트림이 thinking 계열 모델일 때 think=False를
     # 보낸다 — 에이전트 요청에서 reasoning이 출력 예산을 다 써 content가 비는 문제를 막는다.

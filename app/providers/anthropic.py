@@ -206,10 +206,11 @@ class AnthropicProvider(LLMProvider):
     ) -> AsyncGenerator[str, None]:
         params = self._build_params(request, spec)
 
+        chat_id = f"chatcmpl-{uuid.uuid4().hex}"
         async with self.client.messages.stream(**params) as stream:
             async for text in stream.text_stream:
                 chunk = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "id": chat_id,
                     "object": "chat.completion.chunk",
                     "model": request.model,
                     "choices": [
@@ -221,6 +222,24 @@ class AnthropicProvider(LLMProvider):
                     ],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
+
+            # 스트림 종료 후 최종 메시지의 usage를 청크로 노출한다(E-01 — 게이트웨이가
+            # 스트리밍 토큰을 집계해 과금 예산 가드가 스트리밍으로 우회되지 않게 한다).
+            final = await stream.get_final_message()
+            prompt_tokens = final.usage.input_tokens
+            completion_tokens = final.usage.output_tokens
+            usage_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            }
+            yield f"data: {json.dumps(usage_chunk)}\n\n"
 
         yield "data: [DONE]\n\n"
 

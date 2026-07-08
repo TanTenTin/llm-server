@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass, field
 
+from app.config import settings
 from app.models import ChatCompletionRequest
 
 
@@ -34,6 +35,23 @@ class RouteDecision:
     chain: list[ModelSpec]
     # 선택 사유(관측용). auto 라우트면 "auto:tier=complex" 등, 그 외엔 None.
     reason: str | None = None
+
+
+# ─────────────────────────────────────────────────────────────
+# Ollama 런타임 메타 (컨텍스트·capability) — 라우터가 실제 로컬 동작에 맞추기 위한 단일 소스
+# ─────────────────────────────────────────────────────────────
+# (E-02) 로컬 컨텍스트 창은 런타임에 주입되는 num_ctx(settings)와 '한 소스'로 묶는다.
+# 예전엔 registry에 32_000을 하드코딩해 런타임 num_ctx=16384와 어긋나(라우터는 25.6k까지
+# 로컬 OK로 판단, 실제 창은 16384) 그 사이 입력이 조용히 잘렸다. 이제 registry의 ollama
+# context_window가 이 값을 따르므로, num_ctx를 어떤 값으로 두든 라우터 판단이 실제와 일치한다.
+# num_ctx 미지정(≤0=서버 기본 ~2~4k)이면 보수적으로 8192로 잡는다.
+_OLLAMA_CONTEXT_WINDOW = settings.ollama_num_ctx if settings.ollama_num_ctx > 0 else 8192
+
+# (E-03) Ollama /api/tags capabilities 캐시(태그 → ["tools","vision","embedding",...]).
+# 패스스루 ollama 모델의 supports_tools/supports_vision를 실제 모델에 맞추기 위한 근거.
+# lifespan 시작 시 1회 워밍업하고 /v1/models 조회 때마다 갱신한다(update_ollama_capabilities).
+# 비어 있으면(미조회/구버전 Ollama) 기존 보수적 기본값으로 폴백해 회귀가 없다.
+_OLLAMA_CAPABILITIES: dict[str, list[str]] = {}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -90,7 +108,8 @@ MODELS: dict[str, ModelSpec] = {
     "ollama/qwen3:14b": ModelSpec(
         provider="ollama", upstream="qwen3:14b",
         fallback=["gemini-2.5-flash"],      # 로컬 장애/과부하 시 Gemini(무료 클라우드)로 폴백
-        supports_tools=True, context_window=32_000,
+        # (E-02) context_window는 런타임 num_ctx와 한 소스(_OLLAMA_CONTEXT_WINDOW)로 묶는다.
+        supports_tools=True, context_window=_OLLAMA_CONTEXT_WINDOW,
     ),
 }
 
@@ -198,6 +217,40 @@ if DEFAULT_EMBEDDING_MODEL not in EMBEDDING_MODELS:
 # ─────────────────────────────────────────────────────────────
 # 라우팅 결정
 # ─────────────────────────────────────────────────────────────
+def update_ollama_capabilities(models: list[dict]) -> None:
+    """
+    (E-03) list_models(/api/tags) 결과로 capability 캐시를 교체한다(태그 → capabilities).
+    lifespan 시작 워밍업과 /v1/models 조회 핸들러가 호출한다. 조회 실패 시엔 호출하지 않아
+    직전 캐시가 유지된다(빈 캐시면 _ollama_spec이 보수적 기본으로 폴백).
+    """
+    _OLLAMA_CAPABILITIES.clear()
+    for model in models:
+        name = model.get("name")
+        if name:
+            _OLLAMA_CAPABILITIES[name] = model.get("capabilities") or []
+
+
+def _ollama_spec(tag: str) -> ModelSpec:
+    """
+    패스스루 ollama 모델의 spec을 만든다. capability 캐시(/api/tags)가 있으면 tools/vision
+    지원 여부를 실제 모델에 맞추고(예: llava→vision, 텍스트 전용→tools만), context_window는
+    런타임 num_ctx와 한 소스로 묶는다(E-02). 캐시가 없으면(미조회/구버전) 기존 보수적
+    기본값(tools=True, vision=False)으로 폴백해 회귀를 피한다.
+    """
+    caps = _OLLAMA_CAPABILITIES.get(tag)
+    if caps:
+        supports_tools = "tools" in caps
+        supports_vision = "vision" in caps
+    else:
+        supports_tools = True
+        supports_vision = False
+    return ModelSpec(
+        provider="ollama", upstream=tag,
+        supports_tools=supports_tools, supports_vision=supports_vision,
+        context_window=_OLLAMA_CONTEXT_WINDOW,
+    )
+
+
 def _passthrough_spec(model: str) -> ModelSpec | None:
     """
     레지스트리에 없지만 모델명 형태로 provider를 추론할 수 있는 경우 spec 생성.
@@ -206,7 +259,7 @@ def _passthrough_spec(model: str) -> ModelSpec | None:
     (예: 미등록 'claude-x:snapshot' 도 콜론보다 claude- 를 우선해 Anthropic으로)
     """
     if model.startswith("ollama/"):
-        return ModelSpec(provider="ollama", upstream=model.removeprefix("ollama/"))
+        return _ollama_spec(model.removeprefix("ollama/"))
     if model.startswith("anthropic/"):
         return ModelSpec(
             provider="anthropic", upstream=model.removeprefix("anthropic/"),
@@ -231,7 +284,7 @@ def _passthrough_spec(model: str) -> ModelSpec | None:
             supports_vision=True,
         )
     if ":" in model:
-        return ModelSpec(provider="ollama", upstream=model)
+        return _ollama_spec(model)
     return None
 
 

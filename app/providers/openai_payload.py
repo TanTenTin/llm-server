@@ -28,6 +28,10 @@ def build_openai_payload(request: ChatCompletionRequest, spec: ModelSpec) -> dic
         "messages": dumped.get("messages", []),      # 메시지 구조/미지 필드 보존
         "stream": request.stream or False,
     }
+    # 스트리밍이면 마지막에 usage 청크를 받도록 요청한다(E-01 — 게이트웨이가 스트리밍
+    # 토큰을 집계할 수 있게. Gemini OpenAI-compat이 stream_options.include_usage를 지원).
+    if request.stream:
+        payload["stream_options"] = {"include_usage": True}
     for key in _FORWARD_PARAMS:
         if key in dumped:
             payload[key] = dumped[key]
