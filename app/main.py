@@ -19,6 +19,7 @@ from app.adapters import (
 )
 from app.config import settings
 from app.models import ChatCompletionRequest, EmbeddingsRequest
+from app.providers.ollama import OllamaProvider
 from app.realtime import RealtimeBridge
 from app.registry import (
     AUTO_ROUTE,
@@ -224,21 +225,71 @@ async def usage(_auth: None = Depends(require_auth)) -> dict:
     return pool.usage.snapshot()
 
 
+async def _ollama_models(pool: ProviderPool) -> list[dict]:
+    """
+    Ollama 서버에 실제 설치된 모델을 /api/tags로 실시간 조회해 model 항목으로 변환한다.
+    로컬 모델은 운영 중 pull/rm으로 자주 바뀌므로 정적 레지스트리 대신 실측한다.
+    id는 'ollama/<태그>' 형태라 그대로 model 파라미터로 호출 가능(패스스루 라우팅).
+    임베딩 여부는 Ollama가 주는 capabilities(["embedding"])로 판별하고, 구버전이라
+    capabilities가 없으면 이름 휴리스틱("embed" 포함)으로 보완한다.
+    조회 실패(서버 다운 등) 시 레지스트리의 정적 ollama 항목으로 graceful degrade 한다.
+    """
+    provider = pool.get("ollama")   # ollama는 항상 등록되어 있음(로컬 기본 provider)
+    try:
+        models = await provider.list_models() if isinstance(provider, OllamaProvider) else []
+    except Exception:
+        # 서버 미가용 등 — 목록이 비지 않도록 레지스트리의 정적 ollama 항목으로 대체.
+        return [
+            {"id": name, "object": "model", "provider": "ollama", "source": "registry"}
+            for name, spec in {**MODELS, **EMBEDDING_MODELS}.items()
+            if spec.provider == "ollama"
+        ]
+
+    entries: list[dict] = []
+    for model in models:
+        tag = model["name"]
+        capabilities = model.get("capabilities") or []
+        entry: dict = {
+            "id": f"ollama/{tag}", "object": "model",
+            "provider": "ollama", "source": "ollama",
+        }
+        # capabilities 우선, 없으면 이름 기반 추정으로 embedding 모델 표시.
+        if "embedding" in capabilities or ("embed" in tag.lower() and not capabilities):
+            entry["type"] = "embedding"
+        entries.append(entry)
+    return entries
+
+
 @app.get("/v1/models")
 async def list_models(_auth: None = Depends(require_auth)) -> dict:
-    """지원 모델 목록 반환 (레지스트리에서 자동 생성, OpenAI 호환)"""
+    """
+    지원 모델 목록 반환 (OpenAI 호환).
+
+    SaaS provider(gemini·anthropic)는 레지스트리(MODELS/EMBEDDING_MODELS)에서 정적으로
+    나열하고, Ollama는 서버에 실제 설치된 모델을 /api/tags로 실시간 조회해 유동적으로
+    나열한다. 항목의 `source`("registry" | "ollama")로 출처를 구분할 수 있다.
+    """
+    pool: ProviderPool = app.state.pool
+
     # auto는 실제 모델이 아니라 '요청 특성으로 게이트웨이가 고르는' 논리 라우트.
     data: list[dict] = [
         {"id": AUTO_ROUTE, "object": "model", "provider": "(auto)"}
     ]
+    # ── SaaS(정적): ollama 이외 provider만 레지스트리에서 나열 ──
     data += [
-        {"id": name, "object": "model", "provider": spec.provider}
+        {"id": name, "object": "model", "provider": spec.provider, "source": "registry"}
         for name, spec in MODELS.items()
+        if spec.provider != "ollama"
     ]
     data += [
-        {"id": name, "object": "model", "provider": spec.provider, "type": "embedding"}
+        {"id": name, "object": "model", "provider": spec.provider,
+         "type": "embedding", "source": "registry"}
         for name, spec in EMBEDDING_MODELS.items()
+        if spec.provider != "ollama"
     ]
+    # ── Ollama(유동): 서버에 실제 설치된 모델을 실시간 조회 ──
+    data += await _ollama_models(pool)
+
     return {"object": "list", "data": data}
 
 

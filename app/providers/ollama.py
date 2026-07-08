@@ -81,6 +81,23 @@ class OllamaProvider(LLMProvider):
         response.raise_for_status()
         return response.json()
 
+    async def list_models(self) -> list[dict]:
+        """
+        Ollama 서버에 실제 설치된 모델 목록을 조회한다(/api/tags).
+        로컬 모델은 운영 중 pull/rm으로 자주 바뀌므로 레지스트리에 고정하지 않고
+        실시간 조회한다(SaaS provider는 정적 레지스트리로 관리). 서버 미가용 시
+        예외를 그대로 올려 호출 측(/v1/models)이 graceful degrade 하도록 둔다.
+
+        각 항목은 최소 "name"(태그)과, Ollama가 제공하면 "capabilities"
+        (["embedding"] · ["completion","tools",...] 등)를 담는다. 호출 측이
+        capabilities로 chat/embedding 여부를 정확히 구분한다(구버전엔 없을 수 있음).
+        """
+        # /v1/models 응답이 로컬 서버 다운으로 오래 매달리지 않도록 짧은 타임아웃 사용.
+        response = await self.client.get("/api/tags", timeout=5.0)
+        response.raise_for_status()
+        data = response.json()
+        return [m for m in data.get("models", []) if m.get("name")]
+
     async def embed(self, request: EmbeddingsRequest, spec: ModelSpec) -> dict:
         """Ollama OpenAI 호환 /v1/embeddings 프록시. 모델은 사전 pull 필요(미설치면 404 → 폴백)."""
         response = await self.client.post(
