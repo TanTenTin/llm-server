@@ -21,7 +21,7 @@
 
 ```
 app/
-├── main.py        — 엔드포인트 + lifespan(풀·캐시 생성/정리): POST /v1/chat/completions(OpenAI)·/v1/embeddings, POST /v1/messages(Anthropic 네이티브), POST /v1beta/models/{model}:generateContent·:streamGenerateContent(Gemini 네이티브), GET /v1/models, GET /v1/usage(사용량 집계), GET /health(무인증)·/health/providers(심층: 등록/breaker/Ollama 프로브), WS /v1/realtime. 인증(_gateway_keys 쉼표 구분 복수 키)·레이트리밋(_enforce_rate_limit)도 여기
+├── main.py        — 엔드포인트 + lifespan(풀·캐시 생성/정리): POST /v1/chat/completions(OpenAI)·/v1/embeddings, POST /v1/messages(Anthropic 네이티브), POST /v1beta/models/{model}:generateContent·:streamGenerateContent(Gemini 네이티브), GET /v1/models(SaaS 정적+Ollama 실시간, _ollama_models), GET /v1/usage(사용량 집계), GET /health(무인증)·/health/providers(심층: 등록/breaker/Ollama 프로브), WS /v1/realtime. 인증(_gateway_keys 쉼표 구분 복수 키)·레이트리밋(_enforce_rate_limit)도 여기
 ├── config.py      — Settings (GOOGLE_AI_API_KEY, ANTHROPIC_API_KEY, OLLAMA_BASE_URL, GATEWAY_API_KEY(복수 키), BREAKER_COOLDOWN_SECONDS, CACHE_TTL_SECONDS, PAID_DAILY_TOKEN_BUDGET, RATE_LIMIT_RPM, REALTIME_*)
 ├── models.py      — ChatCompletionRequest·EmbeddingsRequest 등 OpenAI 호환 Pydantic 모델 (내부표준 canonical 포맷)
 ├── registry.py    — 라우팅 결정: ModelSpec(+cost_tier/is_free/supports_vision 메타) / RouteDecision / MODELS / ALIASES / DEFAULT_MODEL / resolve() / EMBEDDING_MODELS·EMBED_ALIASES·resolve_embedding() / LIVE_ALIASES·resolve_live_model()
@@ -38,7 +38,7 @@ app/
 └── providers/
     ├── base.py       — LLMProvider ABC: chat(request, spec) / stream(request, spec) / aclose()
     ├── openai_payload.py — OpenAI 패스스루 payload 공용 빌더(build_openai_payload). Gemini·Ollama 공용
-    ├── ollama.py     — Ollama의 OpenAI 호환 API로 프록시(+think는 네이티브 /api/chat 경로)
+    ├── ollama.py     — Ollama의 OpenAI 호환 API로 프록시(+think는 네이티브 /api/chat 경로) + list_models(/api/tags로 설치 모델 실시간 조회 — /v1/models 유동 노출용, name·capabilities 반환)
     ├── gemini.py     — Gemini의 OpenAI 호환 엔드포인트로 프록시 (영속 httpx client, Bearer 인증) + 네이티브 패스스루(generate_native/stream_native: 별도 native_client, x-goog-api-key 인증, /v1beta/models/{m}:generateContent)
     └── anthropic.py  — OpenAI ↔ Anthropic 포맷 변환 후 SDK 호출 (client 재사용)
 ```
@@ -158,7 +158,7 @@ OpenAI와 Anthropic의 차이가 있어서 변환 로직이 들어있다. 수정
 코드 수정 전 알아둘 현재 동작:
 
 - **에러 상태 코드**: `http_status_for()`가 `httpx.HTTPStatusError`/`anthropic.APIStatusError`의 status를 그대로 노출, 연결 실패는 502, `ProviderUnavailable`은 503, 그 외 500. (예전처럼 전부 500이 아님)
-- **`/v1/models`는 레지스트리(MODELS)에서 자동 생성**. 모델 추가는 `registry.py`만 손대면 목록에도 반영됨.
+- **`/v1/models`는 provider별로 다르게 나열**: SaaS(gemini·anthropic)는 레지스트리(`MODELS`/`EMBEDDING_MODELS`)에서 **정적** 생성(`provider != "ollama"` 필터), Ollama는 `OllamaProvider.list_models()`(`/api/tags`)로 실제 설치 모델을 **실시간 조회**해 유동 노출한다. id는 `ollama/<태그>` 형태(패스스루라 그대로 호출 가능), 임베딩 여부는 Ollama가 주는 `capabilities`(`["embedding"]`)로 판별(구버전이면 이름 휴리스틱). Ollama 서버 미가용 시 레지스트리의 정적 ollama 항목으로 graceful degrade. 각 항목의 `source`(`registry`|`ollama`)로 출처 구분. **SaaS 모델 추가는 `registry.py`만 손대면 반영**되고, **로컬 모델은 `ollama pull`/`rm`이 재기동 없이 즉시 반영**된다.
 - **`tool_choice`는 OpenAI 패스스루(Gemini·Ollama)로 전달**: `AnthropicProvider`만 `tool_choice`를 변환/전달하지 않음.
 - **패스스루 미지 필드 보존(extra="allow")**: `models.py`의 요청/메시지 모델이 `extra="allow"`라 모델이 모르는 메시지 구조 필드(예: `tool_calls`)도 버리지 않고 업스트림에 전달. 요청 레벨 파라미터는 `openai_payload.build_openai_payload`의 `_FORWARD_PARAMS` 화이트리스트로 전달(미지의 요청 레벨 필드는 무차별 전달하지 않음 — 메시지 보존/요청 파라미터 선별). passthrough 손실은 `tests/test_passthrough.py`가 회귀로 막음.
 - **silent fallback 주의**: 등록된 모델이 404/연결오류거나 키 미설정이면 fallback 체인의 다음 후보(로컬 Ollama 등)로 조용히 떨어질 수 있다. 실제 사용된 모델은 응답 `model` 필드 또는 **`x-llm-route` 헤더**로 확인.

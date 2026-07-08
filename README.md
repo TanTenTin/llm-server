@@ -283,7 +283,12 @@ OpenAI 호환 embeddings 엔드포인트(RAG 에이전트용). **Gemini embeddin
 GET /v1/models
 ```
 
-> `app/registry.py`의 `MODELS`·`EMBEDDING_MODELS` 레지스트리에서 자동 생성된다(실제 Ollama 설치 모델을 조회하지는 않음). 모델 추가는 레지스트리만 수정하면 이 목록에도 반영된다.
+**provider에 따라 정적/유동으로 나뉜다.**
+
+- **SaaS(gemini·anthropic)** — `app/registry.py`의 `MODELS`·`EMBEDDING_MODELS` 레지스트리에서 **정적**으로 나열한다. 모델 추가는 레지스트리만 수정하면 이 목록에 반영된다.
+- **Ollama(로컬)** — 서버의 `/api/tags`로 **실제 설치된 모델을 실시간 조회**한다(유동). `ollama pull`/`ollama rm`으로 로컬 모델이 바뀌면 **재기동 없이 즉시** 목록에 반영된다. id는 `ollama/<태그>` 형태라 그대로 `model` 파라미터로 호출할 수 있고, 임베딩 모델 여부는 Ollama가 주는 `capabilities`(`["embedding"]`)로 판별한다. Ollama 서버가 응답하지 않으면 레지스트리의 정적 ollama 항목으로 graceful degrade 한다.
+
+각 항목의 `source` 필드(`"registry"` | `"ollama"`)로 정적/유동 출처를 구분할 수 있다(OpenAI 호환 클라이언트는 미지 필드를 무시).
 
 ### Realtime (음성) API
 
@@ -396,7 +401,7 @@ response = await client.chat.completions.create(
 - **동적 쿨다운(Retry-After 반영)**: 쿨다운은 기본 `BREAKER_COOLDOWN_SECONDS`(30초)지만, 업스트림 429 응답에 `Retry-After` 헤더나 Gemini `RetryInfo`(`retryDelay`)가 실려 있으면 **그 값을 그대로 쿨다운으로 쓴다**(상한 1시간 클램프). RPM 초과(수십 초)와 RPD 소진(수 시간)을 같은 30초로 취급해 헛때리던 문제를 해소 — 힌트가 5초면 5초만 기다리고, 하루 쿼터 소진이면 1시간 단위 half-open 탐침으로 전환된다.
 - **과금 예산 가드**: `PAID_DAILY_TOKEN_BUDGET` 설정 시 과금(`is_free=False`) 모델의 하루(UTC) 토큰 합이 예산을 넘으면 **그 후보를 건너뛴다** — 폴백 체인에 무료 후보가 있으면 그쪽으로(trace에 `#budget`), 없으면 402를 반환한다. 에이전트 루프 폭주로 인한 Claude 과금 사고를 게이트웨이 수준에서 차단. (한계: 스트리밍 응답은 토큰이 집계되지 않아 예산 소모로 잡히지 않는다.)
 - **관측성(`x-llm-route` 헤더)**: 응답 본문은 OpenAI 형식 그대로 두고, 실제 라우팅 결과는 `x-llm-route` 응답 헤더로 노출한다 — 예: `requested=gemini-2.5-flash; served=ollama:qwen3:14b; fallback=1`. silent fallback이 일어나도 *무엇이 실제로 응답했는지* 헤더/로그로 바로 확인할 수 있다(호출 측 코드 변경 불필요).
-- **모델 추가/별칭/fallback 변경은 `app/registry.py`의 `MODELS`·`ALIASES`만** 수정하면 된다(`/v1/models` 목록도 자동 반영).
+- **모델 추가/별칭/fallback 변경은 `app/registry.py`의 `MODELS`·`ALIASES`만** 수정하면 된다(SaaS 모델은 `/v1/models` 목록에도 자동 반영). **로컬 Ollama 모델은 레지스트리와 무관하게** `/api/tags` 실시간 조회로 `/v1/models`에 나타나므로, `ollama pull`/`rm`만으로 목록이 갱신된다(패스스루라 호출도 등록 없이 가능).
 
 ## 자동 모델 감시 (model-watch)
 
@@ -453,7 +458,7 @@ llm-server/
 
 1. `app/providers/` 에 새 파일 생성 (`LLMProvider` 상속), `chat(request, spec)`·`stream(request, spec)`·`aclose()` 구현
 2. `app/service.py` 의 `ProviderPool` 에 인스턴스 등록
-3. `app/registry.py` 의 `MODELS`/`_passthrough_spec` 에 라우팅 추가 (`/v1/models` 목록은 `MODELS`에서 자동 반영)
+3. `app/registry.py` 의 `MODELS`/`_passthrough_spec` 에 라우팅 추가 (SaaS provider면 `/v1/models` 목록은 `MODELS`에서 자동 반영. Ollama처럼 설치 모델을 실시간 조회하려면 provider에 목록 조회 메서드를 만들고 `/v1/models` 핸들러에서 병합)
 
 ## 배포 (Oracle + Docker Compose + CI/CD)
 
