@@ -103,6 +103,12 @@ ALIASES: dict[str, str] = {
 # 기본 모델: 로컬 Ollama(qwen3:14b) 우선. 로컬 장애/과부하 시 fallback으로 Gemini(무료 클라우드).
 DEFAULT_MODEL = "ollama/qwen3:14b"
 
+# 로컬(자가호스팅) 후보만 있는 체인에 자동으로 이어붙일 SaaS 폴백(무료 클라우드 우선).
+# 정책: '어떤 로컬 모델이든' 로컬 장애/과부하 시 클라우드로 넘어갈 곳을 보장한다.
+# 레지스트리에 fallback을 안 적은 로컬 모델이나, 패스스루로 들어온 미등록 ollama/* 모델
+# (예: ollama/gemma4:12b)도 이 보장을 받는다. 과금(Claude)은 넣지 않는다 — 비용 0 유지.
+LOCAL_SAAS_FALLBACK: list[str] = ["gemini-2.5-flash"]
+
 # ── Realtime(음성) 모델 별칭 ────────────────────────────────
 # /v1/realtime 의 친화적 별칭 → 실제 Gemini Live 모델 id.
 # 텍스트 모델(MODELS)과 별개의 Live 전용 모델군이라 분리한다.
@@ -235,6 +241,23 @@ def _spec_for(model: str) -> ModelSpec | None:
     return MODELS.get(model) or _passthrough_spec(model)
 
 
+def _ensure_saas_fallback(chain: list[ModelSpec]) -> list[ModelSpec]:
+    """
+    체인이 전부 로컬(provider="ollama")이면 끝에 SaaS 폴백을 이어붙인다.
+    '모든 로컬 모델은 로컬 장애 시 클라우드로 넘어갈 곳이 있어야 한다'는 보장 —
+    레지스트리에 fallback을 안 적은 로컬 모델과 패스스루 ollama/* 모두 커버한다.
+    이미 SaaS(비-ollama) 후보가 있으면 손대지 않는다(중복/불필요 방지).
+    """
+    if any(spec.provider != "ollama" for spec in chain):
+        return chain
+    extended = list(chain)
+    for name in LOCAL_SAAS_FALLBACK:
+        spec = _spec_for(name)
+        if spec is not None and spec not in extended:
+            extended.append(spec)
+    return extended
+
+
 def resolve(model: str) -> RouteDecision:
     """
     모델 이름 → RouteDecision(primary + fallback 체인).
@@ -252,7 +275,7 @@ def resolve(model: str) -> RouteDecision:
         if fb_spec is not None:
             chain.append(fb_spec)
 
-    return RouteDecision(chain=chain)
+    return RouteDecision(chain=_ensure_saas_fallback(chain))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -375,7 +398,8 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
     if not chain:
         # 도구/vision 필터로 전원 탈락(예: 이미지 요청인데 Gemini 후보가 없는 티어) — 최후 폴백
         chain = [MODELS[DEFAULT_MODEL]]
-    return RouteDecision(chain=chain, reason=reason)
+    # auto 후보가 로컬뿐인 경우에도 SaaS 폴백 보장(명시 라우팅과 동일 정책)
+    return RouteDecision(chain=_ensure_saas_fallback(chain), reason=reason)
 
 
 def _embedding_spec_for(model: str) -> ModelSpec | None:
@@ -420,12 +444,37 @@ def resolve_live_model(requested: str | None, default: str) -> str:
     return name if name.startswith("models/") else f"models/{name}"
 
 
+def _guard_context(request: ChatCompletionRequest, decision: RouteDecision) -> RouteDecision:
+    """
+    명시 라우팅(비-auto)의 컨텍스트 초과 방어(P1).
+
+    auto는 _auto_route가 이미 usable 창으로 후보를 거른다. 하지만 사용자가 모델을 직접
+    지정(예: ollama/qwen3:14b)하면 그 필터가 없어, 큰 입력이 로컬의 작은 창을 넘겨도
+    그대로 보내져 업스트림이 프롬프트를 조용히 잘라버린다(에이전트가 지시·도구를 잃음).
+
+    primary가 '추정 입력 + 출력 예산'을 못 담으면:
+      - 체인 안에 담을 수 있는 후보(예: 1M 창의 Gemini 폴백)가 있으면 앞으로 재정렬
+      - 없으면 순서는 두되 reason에 truncate_risk=1을 실어 x-llm-route로 관측되게 한다
+    여유가 있으면 결정을 그대로 반환한다(reason=None 보존).
+    """
+    if not decision.chain:
+        return decision
+    required = _estimate_tokens(request) + (request.max_tokens or 0)
+    if required <= _usable_context(decision.chain[0]):
+        return decision  # primary가 담을 수 있음 — 손대지 않음
+
+    fit = [spec for spec in decision.chain if required <= _usable_context(spec)]
+    unfit = [spec for spec in decision.chain if required > _usable_context(spec)]
+    reason = f"truncate_risk=1,est={required}"
+    return RouteDecision(chain=(fit + unfit) if fit else decision.chain, reason=reason)
+
+
 def route(request: ChatCompletionRequest) -> RouteDecision:
     """
     요청 → RouteDecision 진입점. model="auto"(또는 auto로 향하는 별칭)이면
-    요청 특성 기반 선택(_auto_route), 그 외엔 기존 이름 기반 resolve().
+    요청 특성 기반 선택(_auto_route), 그 외엔 기존 이름 기반 resolve()(+컨텍스트 가드).
     """
     model = ALIASES.get(request.model.strip(), request.model.strip())
     if model == AUTO_ROUTE:
         return _auto_route(request)
-    return resolve(request.model)
+    return _guard_context(request, resolve(request.model))

@@ -104,3 +104,62 @@ def test_estimate_includes_tool_calls():
 def test_reason_exposes_estimated_tokens():
     decision = route(_req("hi"))
     assert ",est=" in decision.reason
+
+
+# ── P1: 명시 라우팅 컨텍스트 가드 (_guard_context) ──────────────
+def test_explicit_local_overflow_reorders_to_large_context():
+    """
+    ollama/qwen3:14b(32k) 명시 + 대용량 입력이면, fallback의 Gemini(1M)를
+    앞으로 재정렬하고 reason에 truncate_risk를 실어야 한다(조용한 잘림 방지).
+    """
+    big = "가" * (40_000 * _CHARS_PER_TOKEN)  # 추정 ~40k 토큰 (로컬 usable 25.6k 초과)
+    decision = route(ChatCompletionRequest(
+        model="ollama/qwen3:14b",
+        messages=[{"role": "user", "content": big}],
+    ))
+    assert decision.reason is not None and "truncate_risk=1" in decision.reason
+    assert decision.chain[0].provider == "gemini"          # 1M 창 후보가 앞으로
+    assert decision.chain[0].context_window == 1_000_000
+
+
+def test_explicit_local_small_input_untouched():
+    """작은 입력이면 결정을 손대지 않는다(primary 유지, reason=None)."""
+    decision = route(ChatCompletionRequest(
+        model="ollama/qwen3:14b",
+        messages=[{"role": "user", "content": "안녕"}],
+    ))
+    assert decision.reason is None
+    assert decision.chain[0].upstream == "qwen3:14b"
+
+
+# ── 모든 로컬 모델에 SaaS 폴백 보장 (_ensure_saas_fallback) ──────
+def test_passthrough_local_gets_saas_fallback():
+    """미등록 패스스루 로컬 모델(ollama/gemma4:12b)도 SaaS(Gemini) 폴백을 받아야 한다."""
+    decision = route(ChatCompletionRequest(
+        model="ollama/gemma4:12b",
+        messages=[{"role": "user", "content": "안녕"}],
+    ))
+    providers = [spec.provider for spec in decision.chain]
+    assert decision.chain[0].provider == "ollama"      # 로컬 primary 유지
+    assert "gemini" in providers                        # SaaS 폴백 자동 부착
+
+
+def test_registry_local_no_duplicate_saas():
+    """이미 gemini 폴백이 있는 로컬 모델엔 중복으로 붙이지 않는다."""
+    decision = route(ChatCompletionRequest(
+        model="ollama/qwen3:14b",
+        messages=[{"role": "user", "content": "안녕"}],
+    ))
+    gemini_count = sum(1 for spec in decision.chain if spec.provider == "gemini")
+    assert gemini_count == 1
+
+
+def test_saas_primary_chain_untouched():
+    """SaaS가 primary면 로컬-only가 아니므로 폴백을 덧붙이지 않는다(기존 체인 유지)."""
+    decision = route(ChatCompletionRequest(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "안녕"}],
+    ))
+    assert decision.chain[0].provider == "gemini"
+    # 기존 fallback(ollama/qwen3:14b)만 유지
+    assert [s.provider for s in decision.chain] == ["gemini", "ollama"]
