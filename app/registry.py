@@ -357,6 +357,10 @@ def _estimate_tokens(request: ChatCompletionRequest) -> int:
     return chars // _CHARS_PER_TOKEN
 
 
+# 공개 별칭 — 다른 모듈(ollama의 동적 num_ctx 산정, E-08)이 같은 추정치를 재사용한다.
+estimate_tokens = _estimate_tokens
+
+
 def _usable_context(spec: ModelSpec) -> int:
     """안전 마진(_CONTEXT_SAFETY_RATIO)을 반영한 실효 컨텍스트 크기(토큰)."""
     return int(spec.context_window * _CONTEXT_SAFETY_RATIO)
@@ -469,10 +473,27 @@ def _embedding_spec_for(model: str) -> ModelSpec | None:
     return None
 
 
+def _ensure_saas_embedding_fallback(chain: list[ModelSpec]) -> list[ModelSpec]:
+    """
+    (E-11) 임베딩 체인이 전부 로컬(ollama)이면 끝에 SaaS 임베딩 폴백을 이어붙인다.
+    chat의 _ensure_saas_fallback와 같은 '로컬 장애 시 클라우드로 넘어갈 곳 보장' 정책을
+    임베딩으로 확장한 것 — 사용자가 ollama/nomic-embed-text 를 직접 지정했는데 미설치(404)여도
+    Gemini 임베딩으로 폴백된다(chat 폴백은 chat 모델이라 임베딩엔 못 쓰므로 전용 함수).
+    이미 SaaS 후보가 있으면 손대지 않는다.
+    """
+    if any(spec.provider != "ollama" for spec in chain):
+        return chain
+    saas = EMBEDDING_MODELS.get(DEFAULT_EMBEDDING_MODEL)
+    if saas is not None and saas.provider != "ollama" and saas not in chain:
+        return [*chain, saas]
+    return chain
+
+
 def resolve_embedding(model: str) -> RouteDecision:
     """
     임베딩 모델 이름 → RouteDecision. chat의 resolve()와 같은 구조지만
     EMBEDDING_MODELS/EMBED_ALIASES 를 본다. 미지 모델은 DEFAULT_EMBEDDING_MODEL로.
+    로컬 전용 체인엔 SaaS 임베딩 폴백을 보장한다(E-11).
     """
     spec = _embedding_spec_for(model.strip()) or EMBEDDING_MODELS[DEFAULT_EMBEDDING_MODEL]
     chain = [spec]
@@ -480,7 +501,7 @@ def resolve_embedding(model: str) -> RouteDecision:
         fb_spec = _embedding_spec_for(fb)
         if fb_spec is not None:
             chain.append(fb_spec)
-    return RouteDecision(chain=chain)
+    return RouteDecision(chain=_ensure_saas_embedding_fallback(chain))
 
 
 def resolve_live_model(requested: str | None, default: str) -> str:

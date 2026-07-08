@@ -23,6 +23,7 @@ from app.providers.ollama import OllamaProvider
 from app.realtime import RealtimeBridge
 from app.registry import (
     AUTO_ROUTE,
+    DEFAULT_MODEL,
     EMBEDDING_MODELS,
     MODELS,
     ModelSpec,
@@ -170,6 +171,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         provider = app.state.pool.get("ollama")
         if isinstance(provider, OllamaProvider):
             update_ollama_capabilities(await provider.list_models())
+            # (E-05) 기본 모델이 로컬이면 예열 — 첫 실요청 콜드스타트 제거(설정 켜졌을 때만).
+            if settings.ollama_warmup:
+                default_spec = MODELS.get(DEFAULT_MODEL)
+                if default_spec is not None and default_spec.provider == "ollama":
+                    await provider.warmup(default_spec)
     except Exception:
         pass
     yield

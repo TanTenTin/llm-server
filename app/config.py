@@ -24,6 +24,21 @@ class Settings(BaseSettings):
     # 보낸다 — 에이전트 요청에서 reasoning이 출력 예산을 다 써 content가 비는 문제를 막는다.
     # thinking 미지원 모델(gemma 등)엔 보내지 않으며, 그래도 400이 나면 think 없이 자동 재시도한다.
     ollama_disable_think: bool = True
+    # (E-05) Ollama가 모델을 메모리에 유지하는 시간(keep_alive). "30m"·"1h"·초 정수·"-1"(상주).
+    # 기본 5분 후 언로드되면 큰 num_ctx의 KV 캐시까지 재적재해 콜드스타트가 크다 → 길게 잡는다.
+    # 빈 문자열이면 payload에 싣지 않아 Ollama 기본(5분)을 따른다.
+    ollama_keep_alive: str = "30m"
+    # (E-05) 기동 시 로컬 기본 모델을 예열(짧은 generate)해 첫 실요청 지연을 없앨지 여부.
+    # True면 lifespan에서 DEFAULT_MODEL(ollama)이면 keep_alive로 1회 로드한다. 배포가 잦으면
+    # 기동이 느려질 수 있어 기본 False(keep_alive만으로도 두 번째 요청부터는 빠르다).
+    ollama_warmup: bool = False
+    # (E-06) 로컬 Ollama 동시 요청 상한(게이트웨이 세마포어). 단일 GPU/CPU 서버에서 동시
+    # 요청이 몰리면 모델 스왑 스래싱·큐 대기 타임아웃이 나므로 직렬화 정도를 제어한다.
+    # 0 이하면 무제한(제한 없음). 스트리밍은 스트림이 끝날 때까지 슬롯을 점유한다.
+    ollama_max_concurrency: int = 0
+    # (E-07) 원격(http/https) 이미지 URL을 게이트웨이가 fetch해 base64로 변환할 때의 최대 크기(바이트).
+    # Ollama images 필드는 base64만 받으므로 원격 URL은 게이트웨이가 받아 변환한다. 초과 시 거부.
+    ollama_max_image_bytes: int = 20_000_000
     # 게이트웨이 공유 인증 토큰. 설정 시 /v1/* 요청에 'Authorization: Bearer <키>' 필요.
     # 비우면 인증 없이 개방 → 외부(llm.tan-kim.com) 노출 시 반드시 설정할 것.
     gateway_api_key: str = ""
