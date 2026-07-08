@@ -96,6 +96,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `GOOGLE_AI_API_KEY` | `""` (빈 값) | Gemini API 키. `gemini-*`(기본 모델) 사용 시 필요. 비면 Gemini 미등록 → 로컬 fallback |
 | `ANTHROPIC_API_KEY` | `""` (빈 값) | Anthropic API 키. `claude-*` 모델 사용 시 필요 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 서버 주소. Docker 배포 시 compose가 `http://ollama:11434`로 주입 |
+| `OLLAMA_NUM_CTX` | `16384` | Ollama 요청 컨텍스트 창(num_ctx, 토큰). 게이트웨이는 Ollama를 **네이티브 `/api/chat`** 경로로 호출해 이 값을 주입한다(OpenAI 호환 `/v1` 경로는 num_ctx를 못 받아 서버 기본 2~4k로 프롬프트가 잘림 — 코딩 에이전트의 큰 시스템 프롬프트·도구 정의 손실의 주원인). `0` 이하면 미지정(서버 기본). 원격 Ollama 호스트에 `OLLAMA_CONTEXT_LENGTH` env를 함께 두면 서버 기본값도 올라간다 |
+| `OLLAMA_DISABLE_THINK` | `true` | qwen3 등 thinking 계열 모델의 내부 reasoning을 기본 비활성화. 요청이 `think`를 명시하지 않고 업스트림이 thinking 모델일 때 `think=false`를 보낸다 — 에이전트 요청에서 reasoning이 출력 예산을 다 써 `content`가 비는 문제를 막는다. thinking 미지원 모델(gemma 등)엔 보내지 않으며, 그래도 400이 나면 think 없이 자동 재시도한다 |
 | `GATEWAY_API_KEY` | `""` (빈 값) | 게이트웨이 인증 토큰. 설정 시 `/v1/*` 요청에 `Authorization: Bearer <키>` 필요. **쉼표 구분 복수 키 지원**(`"key-a, key-b"` — 클라이언트별 발급/회수). **외부 노출 시 반드시 설정** |
 | `BREAKER_COOLDOWN_SECONDS` | `30.0` | 회로차단기 쿨다운(초). provider가 일시 장애(429/5xx/연결오류)를 내면 이 시간 동안 폴백 체인 뒤로 미뤄 헛때리는 지연을 제거하고, 만료 시 자동 복귀. `0` 이하면 비활성화. 업스트림 429의 `Retry-After`/`RetryInfo` 힌트가 있으면 그 값을 우선(상한 1시간) |
 | `CACHE_TTL_SECONDS` | `300.0` | 응답 캐시 TTL(초). 비스트리밍 + `temperature` 미지정/0 인 동일 요청(`/v1/chat/completions`)을 캐시해 무료 쿼터 소모를 줄인다. `0` 이하면 비활성화 |

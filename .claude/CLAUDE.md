@@ -38,7 +38,7 @@ app/
 └── providers/
     ├── base.py       — LLMProvider ABC: chat(request, spec) / stream(request, spec) / aclose()
     ├── openai_payload.py — OpenAI 패스스루 payload 공용 빌더(build_openai_payload). Gemini·Ollama 공용
-    ├── ollama.py     — Ollama의 OpenAI 호환 API로 프록시(+think는 네이티브 /api/chat 경로) + list_models(/api/tags로 설치 모델 실시간 조회 — /v1/models 유동 노출용, name·capabilities 반환)
+    ├── ollama.py     — Ollama를 **네이티브 /api/chat 경로로 호출**(OpenAI 포맷 메시지→네이티브 변환: tool_calls args 문자열↔객체, image_url→images). num_ctx(OLLAMA_NUM_CTX, 컨텍스트 잘림 방지)·num_predict·tools·think를 주입. think는 thinking 계열 모델(qwen3 등)에만 기본 억제(OLLAMA_DISABLE_THINK), 미지원 400이면 think 빼고 자동 재시도. embeddings만 OpenAI 호환 /v1/embeddings 사용. + list_models(/api/tags로 설치 모델 실시간 조회 — /v1/models 유동 노출용, name·capabilities 반환)
     ├── gemini.py     — Gemini의 OpenAI 호환 엔드포인트로 프록시 (영속 httpx client, Bearer 인증) + 네이티브 패스스루(generate_native/stream_native: 별도 native_client, x-goog-api-key 인증, /v1beta/models/{m}:generateContent)
     └── anthropic.py  — OpenAI ↔ Anthropic 포맷 변환 후 SDK 호출 (client 재사용)
 ```
