@@ -17,8 +17,10 @@ from app.registry import (
     _ASCII_CHARS_PER_TOKEN,
     _CONTEXT_SAFETY_RATIO,
     _LONG_INPUT_THRESHOLD,
+    _OLLAMA_CONTEXT_WINDOW,
     _WIDE_CHARS_PER_TOKEN,
     _estimate_tokens,
+    context_overflow,
     route,
 )
 
@@ -127,20 +129,43 @@ def test_reason_exposes_estimated_tokens():
     assert ",est=" in decision.reason
 
 
-# ── P1: 명시 라우팅 컨텍스트 가드 (_guard_context) ──────────────
-def test_explicit_local_overflow_reorders_to_large_context():
+# ── 명시 라우팅 컨텍스트 가드 (_guard_context / context_overflow) ──────────────
+def test_explicit_local_overflow_marks_reason_and_keeps_requested_model():
     """
-    ollama/qwen3:14b(32k) 명시 + 대용량 입력이면, fallback의 Gemini(1M)를
-    앞으로 재정렬하고 reason에 truncate_risk를 실어야 한다(조용한 잘림 방지).
+    ollama/qwen3:14b(32k) 명시 + 대용량 입력이면 reason에 context_overflow를 싣되
+    사용자가 지정한 모델을 그대로 primary로 둔다.
+
+    예전엔 Gemini(1M)를 앞으로 재정렬했지만, 지정한 모델을 말없이 바꿔치기하는 데다
+    그 Gemini가 429로 죽으면 결국 로컬로 되돌아와 조용히 잘렸다. 이제 거부는
+    fallback 루프가 ContextTooLarge(413)로 한다.
     """
-    big = "가" * int(40_000 * _WIDE_CHARS_PER_TOKEN)  # 추정 ~40k 토큰 (로컬 usable 25.6k 초과)
+    big = "가" * int(40_000 * _WIDE_CHARS_PER_TOKEN)  # 추정 ~40k 토큰 (로컬 창 32k 초과)
     decision = route(ChatCompletionRequest(
         model="ollama/qwen3:14b",
         messages=[{"role": "user", "content": big}],
     ))
-    assert decision.reason is not None and "truncate_risk=1" in decision.reason
-    assert decision.chain[0].provider == "gemini"          # 1M 창 후보가 앞으로
-    assert decision.chain[0].context_window == 1_000_000
+    assert decision.reason is not None and "context_overflow=1" in decision.reason
+    assert decision.chain[0].provider == "ollama"       # 지정 모델 유지 — 조용한 바꿔치기 없음
+
+
+def test_context_overflow_detects_only_real_overflow():
+    """창에 담기는 요청은 None, 넘치는 요청만 (필요, 창)을 돌려준다."""
+    spec = route(ChatCompletionRequest(
+        model="ollama/qwen3:14b", messages=[{"role": "user", "content": "hi"}],
+    )).chain[0]
+    assert spec.context_window == _OLLAMA_CONTEXT_WINDOW
+
+    fits = ChatCompletionRequest(model="x", messages=[{"role": "user", "content": "짧은 질문"}])
+    assert context_overflow(fits, spec) is None
+
+    # 창을 확실히 넘는 입력 — 출력 예산(DEFAULT_OUTPUT_BUDGET)도 함께 센다
+    huge = ChatCompletionRequest(
+        model="x", messages=[{"role": "user", "content": "가" * (spec.context_window * 2)}],
+    )
+    overflow = context_overflow(huge, spec)
+    assert overflow is not None
+    required, window = overflow
+    assert required > window == spec.context_window
 
 
 def test_explicit_local_small_input_untouched():

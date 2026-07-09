@@ -197,6 +197,11 @@ AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
 _ASCII_CHARS_PER_TOKEN = 3      # 영문 산문·JSON 도구 스키마 (실측 ~3.8)
 _WIDE_CHARS_PER_TOKEN = 1.2     # 한글·CJK 등 비-ASCII (실측 ~1.2~1.27)
 
+# 요청이 max_tokens를 안 줄 때 출력용으로 예약할 토큰 수.
+# 컨텍스트 초과 판정(context_overflow)과 ollama의 num_ctx 산정(_resolve_num_ctx)이
+# 같은 값을 써야 "보낼 땐 된다고 했는데 실제로 잘리는" 어긋남이 생기지 않는다.
+DEFAULT_OUTPUT_BUDGET = 2048
+
 # 컨텍스트 안전 마진 (Phase 4): context_window의 이 비율까지만 '들어간다'고 본다.
 # _estimate_tokens 가 근사치(과소추정 가능)인 데다, 로컬 모델은 입력·출력이
 # 한 창(num_ctx)을 나눠 쓰므로 창을 꽉 채워 보내면 실제로는 잘리거나 실패한다.
@@ -405,6 +410,19 @@ def _usable_context(spec: ModelSpec) -> int:
     return int(spec.context_window * _CONTEXT_SAFETY_RATIO)
 
 
+def context_overflow(request: ChatCompletionRequest, spec: ModelSpec) -> tuple[int, int] | None:
+    """
+    요청이 spec의 컨텍스트 창에 담기지 않는지 판정한다. 담기면 None, 넘치면 (필요 토큰, 창 크기).
+
+    _usable_context(0.8 마진)가 아니라 창 '전체'와 비교한다 — _estimate_tokens가 실측보다
+    크게 잡는(보수적) 쪽으로 고쳐졌으므로 마진을 이중으로 걸면 실제로는 들어가는 요청까지
+    거부하게 된다. 출력 몫을 함께 세는 건 로컬 모델이 입력·출력으로 한 창(num_ctx)을
+    나눠 쓰기 때문이다 — 입력이 창을 꽉 채우면 답할 자리가 남지 않는다.
+    """
+    required = _estimate_tokens(request) + (request.max_tokens or DEFAULT_OUTPUT_BUDGET)
+    return (required, spec.context_window) if required > spec.context_window else None
+
+
 def _has_images(request: ChatCompletionRequest) -> bool:
     """
     요청에 이미지 입력이 있는지 감지한다(Phase 5: vision capability 필터 근거).
@@ -559,27 +577,30 @@ def resolve_live_model(requested: str | None, default: str) -> str:
 
 def _guard_context(request: ChatCompletionRequest, decision: RouteDecision) -> RouteDecision:
     """
-    명시 라우팅(비-auto)의 컨텍스트 초과 방어(P1).
+    명시 라우팅(비-auto)의 컨텍스트 초과 '표시'(P1).
 
-    auto는 _auto_route가 이미 usable 창으로 후보를 거른다. 하지만 사용자가 모델을 직접
+    auto는 _auto_route가 이미 창 크기로 후보를 거른다. 하지만 사용자가 모델을 직접
     지정(예: ollama/qwen3:14b)하면 그 필터가 없어, 큰 입력이 로컬의 작은 창을 넘겨도
     그대로 보내져 업스트림이 프롬프트를 조용히 잘라버린다(에이전트가 지시·도구를 잃음).
 
-    primary가 '추정 입력 + 출력 예산'을 못 담으면:
-      - 체인 안에 담을 수 있는 후보(예: 1M 창의 Gemini 폴백)가 있으면 앞으로 재정렬
-      - 없으면 순서는 두되 reason에 truncate_risk=1을 실어 x-llm-route로 관측되게 한다
-    여유가 있으면 결정을 그대로 반환한다(reason=None 보존).
+    예전엔 담을 수 있는 후보(1M 창의 Gemini 폴백)를 앞으로 재정렬했다. 그런데 그건
+    사용자가 콕 집어 지정한 모델을 말없이 다른 provider로 바꿔치기하는 셈이고, 그 Gemini가
+    쿼터(429)로 죽으면 결국 로컬로 되돌아와 조용히 잘렸다 — 안전망이 아니라 지연된 실패였다.
+
+    이제는 reason에 표시만 하고, 실제 거부는 fallback 루프가 ContextTooLarge(413)로 즉시
+    처리한다. 컨텍스트 초과는 일시 장애가 아니라 입력 오류이므로 폴백으로 뭉개지 않는다.
     """
     if not decision.chain:
         return decision
-    required = _estimate_tokens(request) + (request.max_tokens or 0)
-    if required <= _usable_context(decision.chain[0]):
-        return decision  # primary가 담을 수 있음 — 손대지 않음
+    overflow = context_overflow(request, decision.chain[0])
+    if overflow is None:
+        return decision  # primary가 담을 수 있음 — 손대지 않음(reason=None 보존)
 
-    fit = [spec for spec in decision.chain if required <= _usable_context(spec)]
-    unfit = [spec for spec in decision.chain if required > _usable_context(spec)]
-    reason = f"truncate_risk=1,est={required}"
-    return RouteDecision(chain=(fit + unfit) if fit else decision.chain, reason=reason)
+    required, window = overflow
+    return RouteDecision(
+        chain=decision.chain,
+        reason=f"context_overflow=1,est={required},window={window}",
+    )
 
 
 def route(request: ChatCompletionRequest) -> RouteDecision:

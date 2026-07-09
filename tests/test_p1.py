@@ -26,7 +26,14 @@ from app.registry import (
     route,
 )
 from app.providers.openai_payload import build_embeddings_payload
-from app.service import BudgetExceeded, ProviderPool, RouteTrace, http_status_for, run_chat_fallback
+from app.service import (
+    BudgetExceeded,
+    ContextTooLarge,
+    ProviderPool,
+    RouteTrace,
+    http_status_for,
+    run_chat_fallback,
+)
 
 
 # ── vision capability 라우팅 ─────────────────────────────────
@@ -168,6 +175,50 @@ def test_budget_exhausted_without_free_fallback_returns_402(monkeypatch):
         raise AssertionError("BudgetExceeded가 나야 함")
     except BudgetExceeded as e:
         assert http_status_for(e) == 402
+
+
+# ── 컨텍스트 초과 = 입력 오류 → 폴백 없이 413 ──────────────────
+def _oversized(model: str) -> ChatCompletionRequest:
+    """로컬 창(32k)을 확실히 넘는 한글 입력."""
+    return ChatCompletionRequest(
+        model=model, messages=[{"role": "user", "content": "가" * 120_000}],
+    )
+
+
+def test_context_overflow_raises_413_without_falling_back():
+    """
+    컨텍스트 초과는 일시 장애가 아니라 입력 오류다. 체인에 1M 창의 Gemini가 있어도
+    조용히 그쪽으로 넘기지 않고 즉시 ContextTooLarge(413)로 실패해야 한다.
+    """
+    pool = ProviderPool()
+    decision = RouteDecision(chain=[MODELS["ollama/qwen3:14b"], MODELS["gemini-2.5-flash"]])
+    trace = RouteTrace(requested="ollama/qwen3:14b")
+
+    async def invoke(spec):
+        raise AssertionError(f"업스트림({spec.provider})이 호출되면 안 된다 — 보내기 전에 막아야 함")
+
+    try:
+        asyncio.run(run_chat_fallback(decision, pool, trace, invoke, _oversized("ollama/qwen3:14b")))
+        raise AssertionError("ContextTooLarge가 나야 함")
+    except ContextTooLarge as e:
+        assert http_status_for(e) == 413
+        assert "컨텍스트 창을 초과" in str(e)
+
+    assert any(a.endswith("#context") for a in trace.attempts)   # 별도 분류로 기록
+    assert trace.served is None                                   # 아무도 응답하지 않음
+
+
+def test_context_within_window_is_not_rejected():
+    """창에 담기는 요청은 가드에 걸리지 않고 정상 처리된다(거짓 양성 방지)."""
+    pool = ProviderPool()
+    decision = RouteDecision(chain=[MODELS["ollama/qwen3:14b"]])
+    small = ChatCompletionRequest(model="ollama/qwen3:14b", messages=[{"role": "user", "content": "안녕"}])
+
+    async def invoke(spec):
+        return {"id": "ok", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    result = asyncio.run(run_chat_fallback(decision, pool, None, invoke, small))
+    assert result["id"] == "ok"
 
 
 def test_budget_disabled_by_default(monkeypatch):

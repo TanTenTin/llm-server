@@ -14,7 +14,7 @@ from app.providers.anthropic import AnthropicProvider
 from app.providers.base import LLMProvider
 from app.providers.gemini import GeminiProvider
 from app.providers.ollama import OllamaProvider
-from app.registry import ModelSpec, RouteDecision
+from app.registry import ModelSpec, RouteDecision, context_overflow
 from app.usage import UsageTracker, sniff_stream_usage
 
 # fallback을 유발하는 HTTP 상태 (provider가 일시적으로/구조적으로 못 받는 상황)
@@ -41,6 +41,17 @@ class BudgetExceeded(Exception):
     과금(paid) provider 일일 토큰 예산(PAID_DAILY_TOKEN_BUDGET) 초과.
     폴백 체인에 무료 후보가 있으면 그쪽으로 넘어가고, 없으면 402로 노출된다.
     에이전트 루프 폭주로 인한 과금 사고를 게이트웨이 수준에서 차단하는 안전판.
+    """
+
+
+class ContextTooLarge(Exception):
+    """
+    요청 입력이 후보 모델의 컨텍스트 창을 넘는다 → 413.
+
+    일시 장애가 아니라 '입력 오류'이므로 폴백하지 않고 즉시 실패한다. Ollama는 이 경우
+    에러 없이 창의 절반만 남기고 앞부분을 버려(시스템 프롬프트·도구 정의·초반 대화 소실)
+    조용히 망가진 응답을 내놓는다. 조용한 절단보다 시끄러운 실패가 낫다 —
+    클라이언트가 대화를 압축하거나 창이 큰 모델로 바꿀 기회를 준다.
     """
 
 
@@ -226,6 +237,39 @@ def _over_paid_budget(spec: ModelSpec, pool: "ProviderPool") -> bool:
     return pool.usage.paid_tokens_today() >= budget
 
 
+def _reject_if_context_overflow(
+    request: ChatCompletionRequest | None,
+    spec: ModelSpec,
+    label: str,
+    pool: "ProviderPool",
+    trace: "RouteTrace | None",
+) -> None:
+    """
+    후보에 요청을 보내기 전 컨텍스트 초과를 검사하고, 넘치면 ContextTooLarge를 던진다.
+
+    폴백하지 않고 즉시 던지는 것이 핵심이다 — 넘치는 입력은 다음 후보에서도 넘치고,
+    Gemini 같은 큰 창으로 조용히 우회하면 사용자가 지정한 모델이 바뀐 걸 모른다.
+    request가 없으면(네이티브 패스스루 경로) 검사를 건너뛴다.
+    """
+    if request is None:
+        return
+    overflow = context_overflow(request, spec)
+    if overflow is None:
+        return
+    required, window = overflow
+    pool.usage.record_error(label, "context")
+    if trace is not None:
+        trace.attempts.append(f"{label}#context")
+    logger.warning(
+        "[route] %s 컨텍스트 초과 → 413 (필요 ~%d토큰 > 창 %d토큰)", label, required, window
+    )
+    raise ContextTooLarge(
+        f"입력이 {label}의 컨텍스트 창을 초과합니다 "
+        f"(필요 ~{required:,}토큰 > 창 {window:,}토큰). "
+        f"대화를 압축하거나, 창이 더 큰 모델을 지정하거나, OLLAMA_NUM_CTX를 올리세요."
+    )
+
+
 def _is_retryable(exc: Exception) -> bool:
     """다음 fallback 후보로 넘어갈 만한 에러인지 판단."""
     # 연결 실패 / 타임아웃 계열
@@ -326,6 +370,8 @@ def http_status_for(exc: Exception) -> int:
         return 503
     if isinstance(exc, BudgetExceeded):
         return 402  # Payment Required — 과금 예산 소진
+    if isinstance(exc, ContextTooLarge):
+        return 413  # Payload Too Large — 입력이 컨텍스트 창 초과
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     if isinstance(exc, anthropic.APIStatusError):
@@ -358,11 +404,13 @@ async def run_chat_fallback(
     pool: ProviderPool,
     trace: RouteTrace | None,
     invoke: Callable[[ModelSpec], Awaitable[dict]],
+    request: ChatCompletionRequest | None = None,
 ) -> dict:
     """
     비스트리밍 fallback 공통 루프. 각 후보 spec마다 `invoke(spec)`을 호출해 결과(이미 응답
     포맷으로 완성된 dict)를 받는다. provider 선택·결과 변환의 구체 방식은 invoke에 위임한다.
     미설정 provider(`ProviderUnavailable`)/재시도 가능 에러면 다음 후보로 넘어간다.
+    `request`를 주면 후보마다 컨텍스트 초과를 먼저 검사해 ContextTooLarge(413)로 즉시 실패한다.
     """
     breaker = pool.breaker
     ordered, deferred = _order_by_breaker(decision.chain, breaker)
@@ -383,6 +431,7 @@ async def run_chat_fallback(
                 trace.attempts.append(f"{label}#budget")
             logger.warning("[route] %s 과금 예산 소진 → 건너뜀", label)
             continue
+        _reject_if_context_overflow(request, spec, label, pool, trace)  # 초과면 즉시 413
         try:
             result = await invoke(spec)
         except ProviderUnavailable as e:
@@ -428,6 +477,7 @@ async def run_stream_fallback(
     pool: ProviderPool,
     trace: RouteTrace | None,
     open_stream: Callable[[ModelSpec], AsyncGenerator[str, None]],
+    request: ChatCompletionRequest | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     스트리밍 fallback 공통 루프 — 첫 청크를 받기 전에 실패한 후보만 건너뛴다.
@@ -454,6 +504,7 @@ async def run_stream_fallback(
                 trace.attempts.append(f"{label}#budget")
             logger.warning("[route] %s 과금 예산 소진 → 건너뜀", label)
             continue
+        _reject_if_context_overflow(request, spec, label, pool, trace)  # 초과면 즉시 413
         try:
             gen = open_stream(spec)  # pool.get 등에서 ProviderUnavailable 가능
         except ProviderUnavailable as e:
@@ -535,7 +586,7 @@ async def chat_with_fallback(
     """OpenAI 경로: 각 후보를 provider.chat(request, spec)로 호출(결과는 OpenAI 포맷)."""
     async def invoke(spec: ModelSpec) -> dict:
         return await pool.get(spec.provider).chat(request, spec)
-    return await run_chat_fallback(decision, pool, trace, invoke)
+    return await run_chat_fallback(decision, pool, trace, invoke, request)
 
 
 async def stream_with_fallback(
@@ -547,5 +598,5 @@ async def stream_with_fallback(
     """OpenAI 경로 스트리밍: 각 후보를 provider.stream(request, spec)로 호출."""
     def open_stream(spec: ModelSpec) -> AsyncGenerator[str, None]:
         return pool.get(spec.provider).stream(request, spec)
-    async for chunk in run_stream_fallback(decision, pool, trace, open_stream):
+    async for chunk in run_stream_fallback(decision, pool, trace, open_stream, request):
         yield chunk

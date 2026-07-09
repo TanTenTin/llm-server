@@ -12,7 +12,12 @@ from app.config import settings
 from app.models import ChatCompletionRequest, EmbeddingsRequest, Message
 from app.providers.base import LLMProvider
 from app.providers.openai_payload import build_embeddings_payload
-from app.registry import ModelSpec, estimate_tokens, ollama_supports_thinking
+from app.registry import (
+    DEFAULT_OUTPUT_BUDGET,
+    ModelSpec,
+    estimate_tokens,
+    ollama_supports_thinking,
+)
 
 # (E-16) connect/read를 분리한다 — 예전엔 단일 스칼라 120s라 죽은 호스트가 폴백까지
 # 최대 120초를 잡아먹었다. connect은 짧게(빠른 폴백 전환), read는 길게(로컬 생성은 느림).
@@ -25,7 +30,6 @@ _IMG_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 # (E-08) 동적 num_ctx 산정 파라미터. 요청 크기에 맞춰 창을 필요한 만큼만 잡아 작은 요청의
 # KV 캐시 적재 비용을 줄인다(큰 요청은 설정 상한까지 확장). 추정이 근사치라 여유를 둔다.
 _INPUT_HEADROOM = 1.25          # 입력 토큰 추정에 곱하는 안전 계수(과소추정 흡수)
-_DEFAULT_OUTPUT_BUDGET = 2048   # max_tokens 미지정 시 출력용으로 예약할 토큰
 _CTX_MARGIN = 1024              # 템플릿·특수토큰 등 추가 여유
 _MIN_NUM_CTX = 4096             # 너무 작게 잡아 잘리는 것을 막는 하한
 _CTX_ROUND = 2048               # num_ctx를 이 배수로 올림(할당 정렬)
@@ -242,7 +246,7 @@ class OllamaProvider(LLMProvider):
         if configured <= 0:
             return None
         needed = int(estimate_tokens(request) * _INPUT_HEADROOM)
-        needed += (request.max_tokens or _DEFAULT_OUTPUT_BUDGET) + _CTX_MARGIN
+        needed += (request.max_tokens or DEFAULT_OUTPUT_BUDGET) + _CTX_MARGIN
         needed = min(max(needed, _MIN_NUM_CTX), configured)
         rounded = ((needed + _CTX_ROUND - 1) // _CTX_ROUND) * _CTX_ROUND
         return min(rounded, configured)
