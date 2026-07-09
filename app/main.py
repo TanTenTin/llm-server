@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Awaitable, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from app.dashboard import DASHBOARD_HTML
 from app.ratelimit import RateLimiter
 
 from app.cache import ResponseCache, cache_key_for
@@ -247,6 +248,33 @@ async def health_providers(_auth: None = Depends(require_auth)) -> dict:
             providers["ollama"]["reachable"] = False
 
     return {"status": "ok", "providers": providers}
+
+
+@app.get("/health/ollama")
+async def health_ollama(_auth: None = Depends(require_auth)) -> dict:
+    """
+    LLM 백엔드 서버(Ollama) 자체의 상세 상태 — 대시보드용. 게이트웨이가 프록시하는 그
+    별도 LLM 서버(OLLAMA_BASE_URL, 이 PC가 아니라 운영에선 Oracle)의 버전·설치된 모델
+    (크기/파라미터/양자화)·현재 메모리에 로드된 모델(size_vram/만료)을 실측한다.
+    Ollama 미등록(항상 등록되긴 하나 방어적)·미가용 시 reachable=False로 degrade.
+    """
+    pool: ProviderPool = app.state.pool
+    provider = pool.get("ollama") if "ollama" in pool.registered() else None
+    if not isinstance(provider, OllamaProvider):
+        return {"reachable": False, "base_url": None, "version": None,
+                "installed": [], "loaded": []}
+    return await provider.server_status()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> str:
+    """
+    관측용 임시 대시보드(self-contained HTML). 셸 자체엔 비밀이 없어 무인증으로 서빙하고,
+    페이지가 브라우저에서 동일 출처로 /health/providers·/v1/usage·/health/ollama를 폴링한다
+    (동일 출처라 CORS·CSP 무관). 게이트웨이 키가 설정돼 있으면 페이지에서 입력한 키를
+    Authorization 헤더로 붙인다. 인메모리 집계라 서버 재기동 시 통계는 리셋된다.
+    """
+    return DASHBOARD_HTML
 
 
 @app.get("/v1/usage")

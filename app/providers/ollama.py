@@ -358,6 +358,59 @@ class OllamaProvider(LLMProvider):
         data = response.json()
         return [m for m in data.get("models", []) if m.get("name")]
 
+    async def server_status(self) -> dict:
+        """
+        LLM 백엔드 서버(Ollama) 자체의 상태를 한 번에 조회한다 — 관측 대시보드용.
+        게이트웨이가 프록시하는 그 별도 LLM 서버(OLLAMA_BASE_URL, 이 PC가 아니라 운영에선
+        Oracle)의 실측 상태다. 세 정보를 모은다:
+          - version: /api/version (서버 버전 문자열)
+          - installed: /api/tags (설치된 모델 — name·size·details{parameter_size,
+            quantization_level, family})
+          - loaded: /api/ps (지금 메모리에 상주 중인 모델 — size·size_vram·expires_at)
+        각 호출은 독립이라 하나가 실패해도 나머지는 채운다(부분 degrade). 전체가 죽어 있으면
+        reachable=False로 표시하고 목록은 빈 채로 둔다.
+        """
+        async def _get(path: str) -> dict | None:
+            try:
+                resp = await self.client.get(path, timeout=5.0)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception:
+                return None
+
+        version, tags, ps = await asyncio.gather(
+            _get("/api/version"), _get("/api/tags"), _get("/api/ps")
+        )
+        reachable = version is not None or tags is not None or ps is not None
+
+        installed = []
+        for m in (tags or {}).get("models", []) if isinstance(tags, dict) else []:
+            details = m.get("details") or {}
+            installed.append({
+                "name": m.get("name"),
+                "size": m.get("size"),
+                "family": details.get("family"),
+                "parameter_size": details.get("parameter_size"),
+                "quantization": details.get("quantization_level"),
+            })
+
+        loaded = []
+        for m in (ps or {}).get("models", []) if isinstance(ps, dict) else []:
+            loaded.append({
+                "name": m.get("name"),
+                "size": m.get("size"),
+                "size_vram": m.get("size_vram"),
+                "expires_at": m.get("expires_at"),
+            })
+
+        return {
+            "reachable": reachable,
+            "base_url": str(self.client.base_url),
+            "version": (version or {}).get("version") if isinstance(version, dict) else None,
+            "installed": installed,
+            "loaded": loaded,
+        }
+
     async def embed(self, request: EmbeddingsRequest, spec: ModelSpec) -> dict:
         """Ollama OpenAI 호환 /v1/embeddings 프록시. 모델은 사전 pull 필요(미설치면 404 → 폴백)."""
         async with self._guard():                     # (E-06) 로컬 동시성 제어
