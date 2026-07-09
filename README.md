@@ -405,6 +405,38 @@ response = await client.chat.completions.create(
 - **관측성(`x-llm-route` 헤더)**: 응답 본문은 OpenAI 형식 그대로 두고, 실제 라우팅 결과는 `x-llm-route` 응답 헤더로 노출한다 — 예: `requested=gemini-2.5-flash; served=ollama:qwen3:14b; fallback=1`. silent fallback이 일어나도 *무엇이 실제로 응답했는지* 헤더/로그로 바로 확인할 수 있다(호출 측 코드 변경 불필요).
 - **모델 추가/별칭/fallback 변경은 `app/registry.py`의 `MODELS`·`ALIASES`만** 수정하면 된다(SaaS 모델은 `/v1/models` 목록에도 자동 반영). **로컬 Ollama 모델은 레지스트리와 무관하게** `/api/tags` 실시간 조회로 `/v1/models`에 나타나므로, `ollama pull`/`rm`만으로 목록이 갱신된다(패스스루라 호출도 등록 없이 가능).
 
+### 로컬 전용 추론 (`x-llm-local-only`)
+
+기본 정책은 **모든 로컬 체인 끝에 SaaS 폴백(`gemini-2.5-flash`)을 붙이는 것**이다(`_ensure_saas_fallback`).
+로컬이 죽어도 응답을 받게 해주지만, *프롬프트·코드가 외부 provider로 나가면 안 되는 호출자*에게는
+`ollama/qwen3:14b`를 콕 집어도 조용히 클라우드로 넘어가는 정책 위반이 된다.
+
+요청에 `x-llm-local-only: 1` 헤더를 실으면 그 폴백을 끈다. **로컬이 죽으면 그냥 실패한다.**
+
+```bash
+curl https://llm.tan-kim.com/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H "x-llm-local-only: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"ollama/qwen3:14b","messages":[{"role":"user","content":"안녕"}]}'
+```
+
+| 요청 | 기본 체인 | `x-llm-local-only: 1` |
+|------|-----------|------------------------|
+| `ollama/qwen3:14b` | `[qwen3:14b, gemini-2.5-flash]` | `[qwen3:14b]` |
+| `auto` (tools 포함 → complex) | `[gemini-2.5-flash, qwen3:14b]` | `[qwen3:14b]` |
+| `auto` (입력 ≥25k → long) | `[gemini-2.5-flash, gemini-2.5-flash-lite]` | `[qwen3:14b]` |
+| `gemini-2.5-flash` (SaaS 명시) | `[gemini-2.5-flash]` | `[qwen3:14b]` (로컬로 강등) |
+
+- 참으로 인정하는 값: `1`·`true`·`yes`·`on` (대소문자·앞뒤 공백 무시). 그 외/미지정은 거짓.
+- SaaS 모델을 명시해도 **로컬로 강등**된다. 조용한 강등이 아니라 `x-llm-route` 헤더의
+  `reason=local_only=1`로 드러나므로 호출자가 확인할 수 있다.
+- long 티어는 후보가 전부 SaaS라 전멸하는데, 이때 `DEFAULT_MODEL`(로컬)로 되돌아온다.
+  입력이 로컬 창을 정말 넘으면 폴백으로 뭉개지 않고 `413 ContextTooLarge`로 정직하게 거절한다.
+- **응답 캐시 공간이 분리된다.** 같은 body라도 일반 요청은 Gemini가 만든 응답을 캐시에 남길 수 있는데,
+  그걸 로컬 전용 호출자에게 돌려주면 보장이 깨지기 때문이다(캐시 키에 `:local-only` 접미사).
+- 적용 범위는 `/v1/chat/completions`다. 네이티브 포맷 엔드포인트(`/v1/messages` 등)는 아직 지원하지 않는다.
+
 ## 자동 모델 감시 (model-watch)
 
 `.github/workflows/model-watch.yml`가 **매일 09:00 KST**에 provider의 모델 목록 API를

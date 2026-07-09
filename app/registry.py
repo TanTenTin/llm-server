@@ -341,13 +341,32 @@ def _ensure_saas_fallback(chain: list[ModelSpec]) -> list[ModelSpec]:
     return extended
 
 
-def resolve(model: str) -> RouteDecision:
+def _local_only_chain(chain: list[ModelSpec]) -> list[ModelSpec]:
+    """
+    체인에서 SaaS(비-ollama) 후보를 모두 제거해 '로컬에서만 추론' 보장을 만든다.
+
+    호출자가 로컬 전용을 요구한 경우(x-llm-local-only)에 쓴다. 기본 정책인
+    _ensure_saas_fallback의 정반대 — 로컬이 죽으면 클라우드로 넘어가는 대신
+    그냥 실패시킨다. 프롬프트/코드가 외부 provider로 나가면 안 되는 호출자
+    (예: 로컬 모델만 쓰기로 한 에이전트)를 위한 것이다.
+
+    필터 결과가 비면(사용자가 gemini-2.5-flash처럼 SaaS 모델을 콕 집은 경우)
+    DEFAULT_MODEL(로컬)로 강등한다. 조용한 강등이 아니라 RouteDecision.reason과
+    x-llm-route 헤더에 local_only=1로 드러나므로 호출자가 확인할 수 있다.
+    """
+    local = [spec for spec in chain if spec.provider == "ollama"]
+    return local or [MODELS[DEFAULT_MODEL]]
+
+
+def resolve(model: str, *, local_only: bool = False) -> RouteDecision:
     """
     모델 이름 → RouteDecision(primary + fallback 체인).
       1. 별칭 치환
       2. 레지스트리 조회, 없으면 형태로 추론(패스스루)
       3. 그래도 모르면 DEFAULT_MODEL(로컬 Ollama)
       4. primary.fallback을 이어붙여 체인 구성
+
+    local_only=True면 4단계 이후 SaaS 후보를 걷어내고 SaaS 폴백도 붙이지 않는다.
     """
     model = model.strip()                       # 앞뒤 공백으로 인한 오라우팅 방지
     spec = _spec_for(model) or MODELS[DEFAULT_MODEL]
@@ -358,6 +377,8 @@ def resolve(model: str) -> RouteDecision:
         if fb_spec is not None:
             chain.append(fb_spec)
 
+    if local_only:
+        return RouteDecision(chain=_local_only_chain(chain), reason="local_only=1")
     return RouteDecision(chain=_ensure_saas_fallback(chain))
 
 
@@ -470,7 +491,7 @@ def _classify_tier(request: ChatCompletionRequest, estimated_tokens: int) -> str
     return "simple"
 
 
-def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
+def _auto_route(request: ChatCompletionRequest, *, local_only: bool = False) -> RouteDecision:
     """
     model="auto" 처리 (Phase 2~4).
       1. 입력 크기를 1회 추정하고 티어(simple/complex/long)에 맞는 후보 셋을 고른다
@@ -499,11 +520,17 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
         candidates = [spec for spec in candidates if spec.supports_tools]
     if needs_vision:
         candidates = [spec for spec in candidates if spec.supports_vision]
+    # 로컬 전용 요청은 후보 단계에서 SaaS를 걷어낸다. long 티어처럼 후보가 전부
+    # SaaS인 경우 여기서 전멸하고, 아래 _local_only_chain이 DEFAULT_MODEL로 되돌린다.
+    if local_only:
+        candidates = [spec for spec in candidates if spec.provider == "ollama"]
 
     chain = [spec for spec in candidates if required_tokens <= _usable_context(spec)]
     reason = f"auto:tier={tier},est={estimated_tokens}"
     if needs_vision:
         reason += ",vision=1"
+    if local_only:
+        reason += ",local_only=1"
 
     if not chain and candidates:
         # 모든 후보의 창을 넘는 초대형 입력 — 그나마 가장 큰 창으로 best-effort
@@ -512,6 +539,9 @@ def _auto_route(request: ChatCompletionRequest) -> RouteDecision:
     if not chain:
         # 도구/vision 필터로 전원 탈락(예: 이미지 요청인데 Gemini 후보가 없는 티어) — 최후 폴백
         chain = [MODELS[DEFAULT_MODEL]]
+    if local_only:
+        # SaaS 폴백을 붙이지 않는다 — 로컬이 죽으면 그대로 실패시킨다.
+        return RouteDecision(chain=_local_only_chain(chain), reason=reason)
     # auto 후보가 로컬뿐인 경우에도 SaaS 폴백 보장(명시 라우팅과 동일 정책)
     return RouteDecision(chain=_ensure_saas_fallback(chain), reason=reason)
 
@@ -603,12 +633,14 @@ def _guard_context(request: ChatCompletionRequest, decision: RouteDecision) -> R
     )
 
 
-def route(request: ChatCompletionRequest) -> RouteDecision:
+def route(request: ChatCompletionRequest, *, local_only: bool = False) -> RouteDecision:
     """
     요청 → RouteDecision 진입점. model="auto"(또는 auto로 향하는 별칭)이면
     요청 특성 기반 선택(_auto_route), 그 외엔 기존 이름 기반 resolve()(+컨텍스트 가드).
+
+    local_only=True(요청 헤더 x-llm-local-only)면 체인을 로컬(ollama) 후보로만 구성한다.
     """
     model = ALIASES.get(request.model.strip(), request.model.strip())
     if model == AUTO_ROUTE:
-        return _auto_route(request)
-    return _guard_context(request, resolve(request.model))
+        return _auto_route(request, local_only=local_only)
+    return _guard_context(request, resolve(request.model, local_only=local_only))
