@@ -13,6 +13,7 @@
 단일 프로세스 인메모리(OrderedDict LRU). CACHE_TTL_SECONDS=0 으로 비활성화.
 """
 
+import asyncio
 import hashlib
 import json
 import time
@@ -47,6 +48,8 @@ class ResponseCache:
         self._max = max_entries
         # key → (만료 시각 monotonic, 응답 body)
         self._store: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+        # (E-15) 진행 중인 동일 요청의 계산을 공유하기 위한 single-flight future 맵.
+        self._inflight: dict[str, asyncio.Future] = {}
 
     @property
     def enabled(self) -> bool:
@@ -70,3 +73,29 @@ class ResponseCache:
         self._store.move_to_end(key)
         while len(self._store) > self._max:
             self._store.popitem(last=False)  # 가장 오래 안 쓰인 엔트리 제거
+
+    # ── single-flight (E-15) — 동일 요청 동시 다발 시 업스트림 중복 호출(스탬피드) 방지 ──
+    def begin(self, key: str) -> tuple[bool, asyncio.Future]:
+        """
+        동일 키가 이미 계산 중이면 (False, 그 future)를 반환해 follower가 결과를 기다리게 하고,
+        없으면 (True, 새 future)를 반환해 leader가 계산하도록 한다. leader는 계산 후 settle 필수.
+        단일 프로세스 코루틴 전제(읽기-쓰기 사이 await 없음 → 락 불필요).
+        """
+        fut = self._inflight.get(key)
+        if fut is not None:
+            return False, fut
+        fut = asyncio.get_running_loop().create_future()
+        self._inflight[key] = fut
+        return True, fut
+
+    def settle(
+        self, key: str, result: dict | None = None, exc: BaseException | None = None
+    ) -> None:
+        """leader가 계산을 마치면 대기 중인 follower들을 결과(또는 예외)로 깨운다."""
+        fut = self._inflight.pop(key, None)
+        if fut is None or fut.done():
+            return
+        if exc is not None:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)

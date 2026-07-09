@@ -67,6 +67,27 @@ def _token_matches(token: str, keys: list[str]) -> bool:
     return matched
 
 
+def _client_ip(headers, client_host: Optional[str]) -> str:
+    """
+    (E-14) 레이트리밋 식별용 클라이언트 IP를 고른다. TRUST_PROXY_FORWARDED_FOR가 켜져 있으면
+    X-Forwarded-For의 첫(=원 클라이언트) IP를 쓴다 — 리버스 프록시(Caddy/nginx) 뒤에서 모든
+    클라이언트가 프록시 IP 하나로 묶여 전원 스로틀되는 문제를 막는다. 꺼져 있으면 소켓 IP.
+    (XFF는 신뢰된 프록시 배치에서만 켤 것 — 직접 노출 시 헤더 스푸핑 가능.)
+    """
+    if settings.trust_proxy_forwarded_for and headers is not None:
+        xff = headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return client_host or "unknown"
+
+
+def _rate_limit_identity(token: Optional[str], headers, client_host: Optional[str]) -> str:
+    """토큰이 있으면 그 해시, 없으면 클라이언트 IP를 레이트리밋 키로 쓴다."""
+    if token:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    return _client_ip(headers, client_host)
+
+
 def _enforce_rate_limit(http_request: Request, token: Optional[str]) -> None:
     """
     키(해시) 또는 클라이언트 IP 단위 분당 요청 제한. 초과 시 429 + Retry-After.
@@ -74,10 +95,8 @@ def _enforce_rate_limit(http_request: Request, token: Optional[str]) -> None:
     """
     if not _rate_limiter.enabled:
         return
-    if token:
-        identity = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
-    else:
-        identity = http_request.client.host if http_request.client else "unknown"
+    client_host = http_request.client.host if http_request.client else None
+    identity = _rate_limit_identity(token, http_request.headers, client_host)
     if not _rate_limiter.allow(identity):
         raise HTTPException(
             status_code=429,
@@ -376,17 +395,32 @@ async def chat_completions(
     # (호출 측 SDK 호환 유지), 라우팅 결과는 x-llm-route 헤더로만 노출한다.
     # decision.reason(auto:tier=... 등 선택 사유)을 헤더에 함께 싣는다.
     trace = RouteTrace(requested=request.model, reason=decision.reason)
+    leader = True
     try:
         if request.stream:
             gen = stream_with_fallback(request, decision, pool, trace)
             return await _streaming_response(gen, trace)
+        # (E-15) single-flight — 동일 요청이 이미 계산 중이면 그 결과를 공유해 업스트림
+        # 중복 호출(스탬피드)을 막는다. 캐시 미스 상태에서만(cache_key 존재) 동작한다.
+        if cache_key:
+            leader, inflight = cache.begin(cache_key)
+            if not leader:
+                shared = await inflight   # 진행 중인 leader의 결과를 기다린다
+                return JSONResponse(content=shared, headers={
+                    "x-llm-route": f"requested={request.model}; served=cache",
+                    "x-llm-cache": "hit-inflight",
+                })
         body = await chat_with_fallback(request, decision, pool, trace)
         headers = {"x-llm-route": trace.header()}
         if cache_key:
             cache.put(cache_key, body)
+            cache.settle(cache_key, result=body)  # follower들을 결과로 깨운다
             headers["x-llm-cache"] = "miss"
         return JSONResponse(content=body, headers=headers)
     except Exception as e:
+        # leader가 실패하면 대기 중인 follower들도 같은 예외로 깨운다(무한 대기 방지).
+        if cache_key and leader:
+            cache.settle(cache_key, exc=e)
         # 업스트림/입력 오류의 원래 상태 + 본문(실제 사유)을 그대로 노출 (모두 500으로 뭉개지 않음)
         raise HTTPException(status_code=http_status_for(e), detail=error_detail(e))
 
@@ -559,6 +593,23 @@ async def realtime(websocket: WebSocket) -> None:
     if not ws_authorized(websocket):
         await websocket.close(code=4401)  # 4401: 애플리케이션 정의 Unauthorized
         return
+
+    # (E-14) WS도 연결 단위로 레이트리밋 — 다수 동시 WS로 Gemini Live를 무제한 중계하며
+    # usage/budget/ratelimit을 우회하던 구멍을 막는다(연결 1건 = 요청 1건으로 집계).
+    if _rate_limiter.enabled:
+        keys = _gateway_keys()
+        ws_token: Optional[str] = None
+        if keys:
+            authorization = websocket.headers.get("authorization")
+            if authorization and authorization.startswith("Bearer "):
+                ws_token = authorization[len("Bearer ") :]
+            else:
+                ws_token = websocket.query_params.get("api_key")
+        client_host = websocket.client.host if websocket.client else None
+        identity = _rate_limit_identity(ws_token, websocket.headers, client_host)
+        if not _rate_limiter.allow(identity):
+            await websocket.close(code=4429)  # 4429: 애플리케이션 정의 Too Many Requests
+            return
 
     bridge = RealtimeBridge(
         api_key=settings.google_ai_api_key,

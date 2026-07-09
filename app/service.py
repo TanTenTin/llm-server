@@ -58,9 +58,13 @@ class CircuitBreaker:
     읽기-쓰기 사이에 await가 없어 별도 락 없이 안전하다.
     """
 
-    def __init__(self, cooldown_seconds: float) -> None:
+    def __init__(self, cooldown_seconds: float, failure_threshold: int = 1) -> None:
         self._cooldown = cooldown_seconds
+        # (E-13) 회로를 열기 전 요구하는 연속 실패 횟수(최소 1). 단발 오류로 provider 전체를
+        # 미루는 과잉 개방을 막는다. 업스트림의 명시적 Retry-After는 임계치와 무관하게 즉시 개방.
+        self._threshold = max(1, failure_threshold)
         self._open_until: dict[str, float] = {}  # provider → 이 시각(monotonic)까지 열림
+        self._failures: dict[str, int] = {}      # provider → 연속 실패 누적(개방 시 리셋)
 
     def is_open(self, provider: str) -> bool:
         if self._cooldown <= 0:
@@ -75,21 +79,27 @@ class CircuitBreaker:
 
     def record_failure(self, provider: str, cooldown_hint: float | None = None) -> float:
         """
-        장애를 기록하고 실제 적용된 쿨다운(초)을 반환한다(로그 표기용).
+        장애를 기록하고 실제 적용된 쿨다운(초)을 반환한다(0 = 임계치 미달, 아직 미개방).
         `cooldown_hint`: 업스트림이 알려준 재시도 대기 시간(Retry-After/RetryInfo).
-        있으면 기본 쿨다운 대신 사용한다 — RPM 초과(수십 초)와 RPD 소진(수 시간)을
-        같은 30초로 취급해 헛때리던 문제를 해소. 상한으로 클램프해 안전을 보장한다.
+        있으면 기본 쿨다운 대신 사용하고, 임계치와 무관하게 즉시 연다(명시적 백오프 신호).
+        힌트가 없으면 연속 실패가 임계치에 도달했을 때만 연다(E-13 — 단발 오류 과잉 개방 방지).
         """
         if self._cooldown <= 0:
             return 0.0  # 회로차단 비활성화 설정 존중 (힌트가 있어도 열지 않음)
+        self._failures[provider] = self._failures.get(provider, 0) + 1
+        explicit = cooldown_hint is not None and cooldown_hint > 0
+        if not explicit and self._failures[provider] < self._threshold:
+            return 0.0  # 임계치 미달 — 아직 열지 않고 실패만 누적
         cooldown = self._cooldown
-        if cooldown_hint is not None and cooldown_hint > 0:
+        if explicit:
             cooldown = min(cooldown_hint, _MAX_DYNAMIC_COOLDOWN_SECONDS)
         self._open_until[provider] = time.monotonic() + cooldown
+        self._failures[provider] = 0  # 개방했으니 카운터 리셋(만료 후 재개방은 다시 누적)
         return cooldown
 
     def record_success(self, provider: str) -> None:
         self._open_until.pop(provider, None)  # 성공하면 즉시 닫음
+        self._failures.pop(provider, None)    # 연속 실패 카운터도 리셋
 
     def status(self) -> dict[str, float]:
         """현재 open 상태인 provider와 남은 쿨다운(초). 헬스체크/관측용."""
@@ -145,7 +155,9 @@ class ProviderPool:
         if settings.google_ai_api_key:
             self._providers["gemini"] = GeminiProvider(settings.google_ai_api_key)
         # provider별 일시 장애를 기억하는 회로차단기 (폴백 경로에서 참조)
-        self.breaker = CircuitBreaker(settings.breaker_cooldown_seconds)
+        self.breaker = CircuitBreaker(
+            settings.breaker_cooldown_seconds, settings.breaker_failure_threshold
+        )
         # 모델별 요청/토큰/에러 집계 (무료 티어 쿼터 관측 — /v1/usage로 노출)
         self.usage = UsageTracker()
 
@@ -387,10 +399,16 @@ async def run_chat_fallback(
             last_exc = e
             if trace is not None:
                 trace.attempts.append(f"{label}#retryable")
-            logger.warning(
-                "[route] %s 일시 장애(%s) → 회로 open %.0fs, 다음 후보로",
-                label, type(e).__name__, cooldown,
-            )
+            if cooldown > 0:
+                logger.warning(
+                    "[route] %s 일시 장애(%s) → 회로 open %.0fs, 다음 후보로",
+                    label, type(e).__name__, cooldown,
+                )
+            else:
+                logger.warning(
+                    "[route] %s 일시 장애(%s) → 실패 누적(임계치 미달), 다음 후보로",
+                    label, type(e).__name__,
+                )
             continue
         # 성공
         breaker.record_success(spec.provider)
@@ -467,10 +485,16 @@ async def run_stream_fallback(
             last_exc = e
             if trace is not None:
                 trace.attempts.append(f"{label}#retryable")
-            logger.warning(
-                "[route] %s 스트림 시작 실패(%s) → 회로 open %.0fs, 다음 후보로",
-                label, type(e).__name__, cooldown,
-            )
+            if cooldown > 0:
+                logger.warning(
+                    "[route] %s 스트림 시작 실패(%s) → 회로 open %.0fs, 다음 후보로",
+                    label, type(e).__name__, cooldown,
+                )
+            else:
+                logger.warning(
+                    "[route] %s 스트림 시작 실패(%s) → 실패 누적(임계치 미달), 다음 후보로",
+                    label, type(e).__name__,
+                )
             continue
 
         # 첫 청크 확보 — 이후엔 fallback 없이 끝까지 흘려보내되 항상 정리.

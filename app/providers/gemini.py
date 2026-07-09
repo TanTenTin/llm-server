@@ -12,7 +12,9 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 # 네이티브 generateContent 엔드포인트(패스스루용). OpenAI-compat와 달리 '/openai' 가 없고
 # 인증은 x-goog-api-key 헤더(또는 ?key=)로 한다(Bearer는 OAuth 토큰용이라 API 키엔 안 맞음).
 GEMINI_NATIVE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-TIMEOUT = 120.0
+# (E-16) connect/read 분리 — 죽은/느린 호스트가 폴백을 최대 120초 잡아먹던 문제 해소.
+TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
+_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 
 
 class GeminiProvider(LLMProvider):
@@ -21,12 +23,14 @@ class GeminiProvider(LLMProvider):
             base_url=GEMINI_BASE_URL,
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=TIMEOUT,
+            limits=_LIMITS,
         )
         # 네이티브 패스스루 전용 client (별도 base_url·인증 방식). 영속 재사용.
         self.native_client = httpx.AsyncClient(
             base_url=GEMINI_NATIVE_BASE_URL,
             headers={"x-goog-api-key": api_key},
             timeout=TIMEOUT,
+            limits=_LIMITS,
         )
 
     def _build_payload(self, request: ChatCompletionRequest, spec: ModelSpec) -> dict:

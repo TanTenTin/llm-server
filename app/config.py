@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # 0 이하로 두면 회로차단 비활성화(기존처럼 매 요청 primary부터 시도).
     # 업스트림 429에 Retry-After/RetryInfo가 있으면 그 값이 이 기본값 대신 쓰인다(상한 1시간).
     breaker_cooldown_seconds: float = 30.0
+    # (E-13) 회로를 열기 전 요구하는 연속 실패 횟수. 단발 429/일시 오류 하나로 provider 전체를
+    # 뒤로 미루는 과잉 개방을 막는다. 단, 업스트림이 Retry-After를 명시하면(명시적 백오프 신호)
+    # 임계치와 무관하게 즉시 연다. 1이면 기존처럼 첫 실패에 개방.
+    breaker_failure_threshold: int = 2
+    # (E-14) 리버스 프록시(Caddy/nginx) 뒤에서 X-Forwarded-For의 첫 IP를 클라이언트로 신뢰할지.
+    # 켜면 프록시 뒤에서도 실제 클라이언트 IP 단위로 레이트리밋이 걸린다. 프록시가 XFF를
+    # 덮어써 주는 신뢰된 배치에서만 켤 것(직접 노출 시 스푸핑 가능). 기본 False(=프록시 IP 사용).
+    trust_proxy_forwarded_for: bool = False
     # 응답 캐시 TTL(초). 비스트리밍 + temperature 미지정/0 인 동일 요청(/v1/chat/completions)을
     # 이 시간 동안 캐시해 무료 티어 쿼터 소모를 줄인다. 0 이하면 캐시 비활성화.
     cache_ttl_seconds: float = 300.0

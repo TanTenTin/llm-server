@@ -14,7 +14,13 @@ from app.providers.base import LLMProvider
 from app.providers.openai_payload import build_embeddings_payload
 from app.registry import ModelSpec, estimate_tokens
 
-TIMEOUT = 120.0
+# (E-16) connect/read를 분리한다 — 예전엔 단일 스칼라 120s라 죽은 호스트가 폴백까지
+# 최대 120초를 잡아먹었다. connect은 짧게(빠른 폴백 전환), read는 길게(로컬 생성은 느림).
+TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
+# 커넥션 풀 상한 명시(기본값 의존 제거).
+_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
+# 원격 이미지 fetch용 타임아웃(로컬 생성보다 짧게).
+_IMG_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 
 # (E-08) 동적 num_ctx 산정 파라미터. 요청 크기에 맞춰 창을 필요한 만큼만 잡아 작은 요청의
 # KV 캐시 적재 비용을 줄인다(큰 요청은 설정 상한까지 확장). 추정이 근사치라 여유를 둔다.
@@ -150,9 +156,11 @@ class OllamaProvider(LLMProvider):
         # Ollama 네이티브 /api/chat 엔드포인트를 사용한다(OpenAI-compat /v1 은 num_ctx·think를
         # 받지 못해 컨텍스트가 서버 기본값으로 잘리고 thinking을 못 끄기 때문).
         # client는 앱 생애주기 동안 재사용 → 커넥션 keep-alive.
-        self.client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=TIMEOUT)
+        self.client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"), timeout=TIMEOUT, limits=_LIMITS
+        )
         # (E-07) 원격 이미지 URL을 base64로 받아오는 별도 client(base_url 없이 임의 호스트 호출).
-        self._img_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self._img_client = httpx.AsyncClient(timeout=_IMG_TIMEOUT, follow_redirects=True)
         # (E-06) 로컬 동시 요청 상한. 단일 GPU/CPU에서 동시 호출이 몰릴 때 직렬화 정도를 제어.
         n = settings.ollama_max_concurrency
         self._sem: asyncio.Semaphore | None = asyncio.Semaphore(n) if n > 0 else None
