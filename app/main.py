@@ -397,18 +397,35 @@ async def _streaming_response(
     )
 
 
+def is_local_only(header_value: Optional[str]) -> bool:
+    """
+    x-llm-local-only 헤더 해석. 참이면 SaaS provider(Gemini·Anthropic)를 라우팅 체인에서
+    배제하고 로컬 Ollama로만 추론한다 — 로컬이 죽어도 클라우드로 넘기지 않고 실패시킨다.
+    프롬프트/코드를 외부로 내보내면 안 되는 호출자(로컬 모델 전용 에이전트 등)를 위한 것.
+    """
+    if header_value is None:
+        return False
+    return header_value.strip().lower() in ("1", "true", "yes", "on")
+
+
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(
     request: ChatCompletionRequest,
     _auth: None = Depends(require_auth),
+    x_llm_local_only: Optional[str] = Header(default=None),
 ) -> dict | StreamingResponse:
     """OpenAI 호환 chat completions 엔드포인트"""
     pool: ProviderPool = app.state.pool
     cache: ResponseCache = app.state.cache
+    local_only = is_local_only(x_llm_local_only)
 
     # 응답 캐시 — 비스트리밍 + temperature 미지정/0 인 동일 요청만 대상(cache_key_for).
     # 히트 시 업스트림 무호출 → 무료 티어 쿼터 절약. 절약분은 'cache' 라벨로 /v1/usage에 집계.
     cache_key = cache_key_for(request) if cache.enabled else None
+    # 로컬 전용 요청은 캐시 공간을 분리한다. 같은 body라도 일반 요청은 Gemini가 만든 응답을
+    # 캐시에 남길 수 있는데, 그걸 로컬 전용 호출자에게 돌려주면 "로컬만 쓴다"는 보장이 깨진다.
+    if cache_key and local_only:
+        cache_key = f"{cache_key}:local-only"
     if cache_key:
         cached = cache.get(cache_key)
         if cached is not None:
@@ -418,7 +435,7 @@ async def chat_completions(
                 "x-llm-cache": "hit",
             })
 
-    decision = route(request)  # auto면 요청 특성 기반 선택, 그 외엔 이름 기반
+    decision = route(request, local_only=local_only)  # auto면 요청 특성 기반 선택, 그 외엔 이름 기반
     # 실제로 어떤 모델이 응답했는지 관측용 트레이스. 응답 본문은 OpenAI 형식 그대로 두고
     # (호출 측 SDK 호환 유지), 라우팅 결과는 x-llm-route 헤더로만 노출한다.
     # decision.reason(auto:tier=... 등 선택 사유)을 헤더에 함께 싣는다.
