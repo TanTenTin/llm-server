@@ -13,6 +13,7 @@ from app.registry import (
     resolve,
     update_ollama_capabilities,
 )
+from app.providers.ollama import _is_thinking_model
 from app.usage import UsageTracker, sniff_stream_usage
 
 
@@ -114,3 +115,31 @@ def test_capability_empty_cache_falls_back_to_defaults() -> None:
     spec = resolve("ollama/unknown-model:latest").chain[0]
     assert spec.supports_tools is True
     assert spec.supports_vision is False
+
+
+# ─────────────────────────────────────────────────────────────
+# thinking 판정 — capability 우선, 접두사는 폴백
+# ─────────────────────────────────────────────────────────────
+def test_thinking_detected_from_capability_not_prefix() -> None:
+    """
+    접두사 목록에 없는 thinking 모델도 capability로 잡아야 한다.
+    (ornith:9b가 목록에 없어 think가 켜진 채 돌았고, 모델이 출력 예산을 사고에 다 써서
+    content=""인 빈 응답이 나갔다.)
+    """
+    update_ollama_capabilities([
+        {"name": "novel-thinker:7b", "capabilities": ["completion", "tools", "thinking"]},
+        {"name": "gemma4:e4b", "capabilities": ["completion", "vision"]},
+    ])
+    try:
+        assert _is_thinking_model("novel-thinker:7b") is True   # 접두사엔 없지만 capability로 잡힘
+        assert _is_thinking_model("gemma4:e4b") is False        # think 보내면 400 → 보내면 안 됨
+    finally:
+        update_ollama_capabilities([])
+
+
+def test_thinking_falls_back_to_prefix_without_capability() -> None:
+    """capability 근거가 없으면(구버전 Ollama) 접두사 휴리스틱으로 폴백한다."""
+    update_ollama_capabilities([])
+    assert _is_thinking_model("qwen3:14b") is True
+    assert _is_thinking_model("ornith:9b") is True
+    assert _is_thinking_model("gemma4:e4b") is False

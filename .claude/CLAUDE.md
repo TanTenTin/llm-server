@@ -38,7 +38,7 @@ app/
 └── providers/
     ├── base.py       — LLMProvider ABC: chat(request, spec) / stream(request, spec) / aclose()
     ├── openai_payload.py — OpenAI 패스스루 payload 공용 빌더(build_openai_payload). Gemini·Ollama 공용
-    ├── ollama.py     — Ollama를 **네이티브 /api/chat 경로로 호출**(OpenAI 포맷 메시지→네이티브 변환: tool_calls args 문자열↔객체, image_url→images). num_ctx(OLLAMA_NUM_CTX, 컨텍스트 잘림 방지)·num_predict·tools·think를 주입. think는 thinking 계열 모델(qwen3 등)에만 기본 억제(OLLAMA_DISABLE_THINK), 미지원 400이면 think 빼고 자동 재시도. embeddings만 OpenAI 호환 /v1/embeddings 사용. + list_models(/api/tags로 설치 모델 실시간 조회 — /v1/models 유동 노출용, name·capabilities 반환)
+    ├── ollama.py     — Ollama를 **네이티브 /api/chat 경로로 호출**(OpenAI 포맷 메시지→네이티브 변환: tool_calls args 문자열↔객체, image_url→images). num_ctx(OLLAMA_NUM_CTX, 컨텍스트 잘림 방지)·num_predict·tools·think를 주입. think는 thinking 계열 모델에만 기본 억제(OLLAMA_DISABLE_THINK), 미지원 400이면 think 빼고 자동 재시도. **thinking 판정(`_is_thinking_model`)은 `/api/tags` capability(`registry.ollama_supports_thinking`) 우선**, 근거 없을 때만 접두사 목록(`_THINKING_MODEL_PREFIXES`)으로 폴백 — 접두사만 쓰면 목록에 없는 신규 thinking 모델(ornith 등)에서 think가 켜진 채 돌아 출력 예산을 사고에 다 쓰고 `content=""` 빈 응답이 나간다. embeddings만 OpenAI 호환 /v1/embeddings 사용. + list_models(/api/tags로 설치 모델 실시간 조회 — /v1/models 유동 노출용, name·capabilities 반환)
     ├── gemini.py     — Gemini의 OpenAI 호환 엔드포인트로 프록시 (영속 httpx client, Bearer 인증) + 네이티브 패스스루(generate_native/stream_native: 별도 native_client, x-goog-api-key 인증, /v1beta/models/{m}:generateContent)
     └── anthropic.py  — OpenAI ↔ Anthropic 포맷 변환 후 SDK 호출 (client 재사용)
 ```
@@ -89,7 +89,7 @@ POST /v1/chat/completions
   - simple → [gemini-2.5-flash-lite, ollama/qwen3:14b] / complex → [gemini-2.5-flash, ollama/qwen3:14b]. 모든 티어 무료만, **과금(Claude) 미포함**(비용 0 보장).
 - **capability 필터(Phase 2·4·5)**: `tools` 있는데 `supports_tools=False`면 제외. 이미지(`image_url` 파트, `_has_images`) 있는데 `supports_vision=False`면 제외(reason에 `,vision=1`) — 네이티브 어댑터가 Anthropic `image`/Gemini `inlineData`를 이미 `image_url`로 변환하므로 OpenAI 포맷만 보면 됨. 컨텍스트는 `추정 입력 + request.max_tokens(출력 예산)` > `_usable_context(spec)`(= `context_window` × `_CONTEXT_SAFETY_RATIO(0.8)`)이면 제외 — 추정 오차 + 로컬의 입력·출력 공유 창을 흡수하는 안전 마진.
 - **overflow best-effort(Phase 4)**: 컨텍스트 초과로 전원 탈락 시 후보 중 `context_window` 최대 모델 1개를 시도(reason에 `,overflow=1`). DEFAULT_MODEL 무조건 폴백은 이미 탈락한 모델 재선택이라 폐기. 도구 필터로 전원 탈락하는 경우(현 레지스트리엔 없음)만 DEFAULT_MODEL 최후 폴백.
-- **토큰 추정(`_estimate_tokens`)**: 메시지 content + 멀티턴 `tool_calls`(함수 인자 — 에이전트 대화에서 커짐) + 도구 정의를 문자수÷`_CHARS_PER_TOKEN=3`으로 근사.
+- **토큰 추정(`_estimate_tokens`)**: 메시지 content + 멀티턴 `tool_calls`(함수 인자 — 에이전트 대화에서 커짐) + 도구 정의를 문자수로 근사하되, **ASCII와 비-ASCII를 나눠 센다**(`_ASCII_CHARS_PER_TOKEN=3` / `_WIDE_CHARS_PER_TOKEN=1.2`, `_text_tokens`). 단일 계수 3으로 뭉뚱그리면 한글을 ~1.85배 과소추정해 `_resolve_num_ctx`가 창을 작게 잡고 **Ollama가 프롬프트 앞부분을 조용히 잘라낸다**(창의 절반만 남김). 과소추정만 잘림을 만들므로 양쪽 다 실측보다 보수적인 값을 쓴다.
 - 선택 사유는 `RouteDecision.reason`("auto:tier=long,est=45000" 형태)으로 실려 `x-llm-route` 헤더에 `reason=`으로 노출. 살아남은 후보가 그대로 체인이 되어 Phase 1 회로차단기·폴백 동일 적용.
 - capability 메타는 `ModelSpec.supports_tools`·`context_window`(MODELS에서 모델별 지정). 회귀 테스트: `tests/test_auto_route.py`.
 

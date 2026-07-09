@@ -12,7 +12,7 @@ from app.config import settings
 from app.models import ChatCompletionRequest, EmbeddingsRequest, Message
 from app.providers.base import LLMProvider
 from app.providers.openai_payload import build_embeddings_payload
-from app.registry import ModelSpec, estimate_tokens
+from app.registry import ModelSpec, estimate_tokens, ollama_supports_thinking
 
 # (E-16) connect/read를 분리한다 — 예전엔 단일 스칼라 120s라 죽은 호스트가 폴백까지
 # 최대 120초를 잡아먹었다. connect은 짧게(빠른 폴백 전환), read는 길게(로컬 생성은 느림).
@@ -30,15 +30,25 @@ _CTX_MARGIN = 1024              # 템플릿·특수토큰 등 추가 여유
 _MIN_NUM_CTX = 4096             # 너무 작게 잡아 잘리는 것을 막는 하한
 _CTX_ROUND = 2048               # num_ctx를 이 배수로 올림(할당 정렬)
 
-# thinking(사고) 계열로 알려진 Ollama 모델 접두사.
-# 이 목록에 걸리는 모델에만 think=False를 보낸다 — thinking 미지원 모델(gemma 등)에
+# thinking(사고) 계열로 알려진 Ollama 모델 접두사 — capability 캐시가 비었을 때만 쓰는 폴백.
+# 이 판정에 걸리는 모델에만 think=False를 보낸다 — thinking 미지원 모델(gemma 등)에
 # think 필드를 보내면 Ollama가 400("does not support thinking")을 내기 때문이다.
 # (heuristic이 놓쳐도 chat()/stream()이 400을 잡아 think 없이 자동 재시도한다.)
-_THINKING_MODEL_PREFIXES = ("qwen3", "deepseek-r1", "qwq", "magistral")
+_THINKING_MODEL_PREFIXES = ("qwen3", "deepseek-r1", "qwq", "magistral", "ornith")
 
 
 def _is_thinking_model(upstream: str) -> bool:
-    """업스트림 모델명이 thinking 계열인지 접두사로 추정한다."""
+    """
+    업스트림 모델이 thinking 계열인지 판정한다.
+
+    Ollama /api/tags의 capabilities에 근거가 있으면 그것을 신뢰하고, 없을 때만
+    접두사 휴리스틱으로 폴백한다. 접두사 목록은 새 모델이 나올 때마다 새는 구멍이라
+    (ornith:9b가 목록에 없어 think가 켜진 채로 돌았고, 모델이 출력 예산을 사고에
+    다 써서 content="" 빈 응답이 나갔다) capability를 우선한다.
+    """
+    supported = ollama_supports_thinking(upstream)
+    if supported is not None:
+        return supported
     name = upstream.lower()
     return any(name.startswith(prefix) for prefix in _THINKING_MODEL_PREFIXES)
 

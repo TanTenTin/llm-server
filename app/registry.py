@@ -179,9 +179,23 @@ AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
     "long": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],   # 대용량 입력은 로컬 32k 불가 → 클라우드
 }
 
-# 토큰 추정 계수: char 수 → 대략의 토큰 수(한글/혼합 보수적으로 3 chars/token 가정).
-# 정확한 토큰화가 아니라 "32k 로컬에 들어가나, 1M 클라우드가 필요한가" 판단용 근사치.
-_CHARS_PER_TOKEN = 3
+# 토큰 추정 계수: char 수 → 대략의 토큰 수. 정확한 토큰화가 아니라
+# "32k 로컬에 들어가나, 1M 클라우드가 필요한가" 판단용 근사치.
+#
+# ASCII와 비-ASCII를 나눠 센다. 예전엔 전부 3 chars/token으로 뭉뚱그렸는데, 그러면
+# 한글 입력을 약 1.85배 과소추정한다. 그 결과 ollama의 동적 num_ctx(_resolve_num_ctx)가
+# 실제 프롬프트보다 작게 잡히고, Ollama는 초과분을 에러 없이 '창의 절반만 남기고
+# 앞부분을 버리는' 식으로 잘라낸다(에이전트가 시스템 프롬프트·도구 정의·초반 대화를 통째로 잃음).
+#
+# 실측(ollama/ornith:9b, 한글 산문 6,000자 = 3,704토큰): 문장 전체로는 1.62 chars/token이지만
+# 그 문장은 30%가 ASCII(띄어쓰기·마침표)였다. 띄어쓰기는 뒤따르는 한글 토큰에 흡수돼 거의
+# 공짜이므로, 한글 글자 자체의 밀도는 ~1.2 chars/token이다. 1.62를 그대로 쓰면 한글 비중이
+# 높은 입력에서 다시 과소추정된다.
+#
+# 과소추정만이 잘림을 만들고(과다추정은 창을 넉넉히 잡아 KV 캐시만 더 쓴다) 낭비는
+# OLLAMA_NUM_CTX 상한이 막아주므로, 양쪽 다 실측보다 낮은(=보수적) 값을 쓴다.
+_ASCII_CHARS_PER_TOKEN = 3      # 영문 산문·JSON 도구 스키마 (실측 ~3.8)
+_WIDE_CHARS_PER_TOKEN = 1.2     # 한글·CJK 등 비-ASCII (실측 ~1.2~1.27)
 
 # 컨텍스트 안전 마진 (Phase 4): context_window의 이 비율까지만 '들어간다'고 본다.
 # _estimate_tokens 가 근사치(과소추정 가능)인 데다, 로컬 모델은 입력·출력이
@@ -228,6 +242,17 @@ def update_ollama_capabilities(models: list[dict]) -> None:
         name = model.get("name")
         if name:
             _OLLAMA_CAPABILITIES[name] = model.get("capabilities") or []
+
+
+def ollama_supports_thinking(tag: str) -> bool | None:
+    """
+    태그가 thinking(사고)을 지원하는지 capability 캐시로 판정한다.
+    캐시에 근거가 없으면(미조회·구버전 Ollama) None — 호출 측이 접두사 휴리스틱으로 폴백한다.
+    """
+    caps = _OLLAMA_CAPABILITIES.get(tag)
+    if not caps:
+        return None
+    return "thinking" in caps
 
 
 def _ollama_spec(tag: str) -> ModelSpec:
@@ -334,27 +359,41 @@ def resolve(model: str) -> RouteDecision:
 # ─────────────────────────────────────────────────────────────
 # auto 라우팅 (Phase 2~4) — 요청 특성으로 모델을 직접 선택
 # ─────────────────────────────────────────────────────────────
+def _text_tokens(text: str) -> float:
+    """
+    문자열 하나의 추정 토큰 수. ASCII/비-ASCII를 나눠 각자의 계수로 환산한다.
+
+    글자를 순회하지 않고 UTF-8 바이트 길이로 비-ASCII 글자 수를 역산한다
+    (ASCII=1바이트, 한글·CJK=3바이트 → 비-ASCII 글자수 ≈ (bytes - len) / 2).
+    4바이트인 이모지는 약간 과다 계상되는데, 과다추정은 창을 넉넉히 잡을 뿐
+    잘림을 만들지 않으므로 안전한 방향의 오차다.
+    """
+    total = len(text)
+    wide = (len(text.encode("utf-8")) - total) // 2
+    return (total - wide) / _ASCII_CHARS_PER_TOKEN + wide / _WIDE_CHARS_PER_TOKEN
+
+
 def _estimate_tokens(request: ChatCompletionRequest) -> int:
     """
     요청 입력 크기를 토큰 단위로 근사한다(메시지 + 도구 호출 이력 + 도구 정의).
-    문자열 content는 길이, 비-문자열(멀티모달 등)은 JSON 직렬화 길이로 센 뒤
-    _CHARS_PER_TOKEN으로 나눈다. context_window 적합성 판단용 근사치일 뿐
+    문자열 content는 그대로, 비-문자열(멀티모달 등)은 JSON 직렬화 결과를
+    _text_tokens로 환산한다. context_window 적합성 판단용 근사치일 뿐
     정확한 토큰화가 아니다.
     """
-    chars = 0
+    tokens = 0.0
     for message in request.messages:
         content = message.content
         if isinstance(content, str):
-            chars += len(content)
+            tokens += _text_tokens(content)
         elif content is not None:
-            chars += len(json.dumps(content, ensure_ascii=False))
+            tokens += _text_tokens(json.dumps(content, ensure_ascii=False))
         # 멀티턴 도구 왕복의 tool_calls(함수 인자)도 입력 컨텍스트를 차지한다 —
         # 에이전트 대화에선 인자가 파일 내용 등으로 커질 수 있어 빼면 과소추정된다.
         if message.tool_calls:
-            chars += len(json.dumps(message.tool_calls, ensure_ascii=False, default=str))
+            tokens += _text_tokens(json.dumps(message.tool_calls, ensure_ascii=False, default=str))
     if request.tools:
-        chars += len(json.dumps([t.model_dump() for t in request.tools], ensure_ascii=False))
-    return chars // _CHARS_PER_TOKEN
+        tokens += _text_tokens(json.dumps([t.model_dump() for t in request.tools], ensure_ascii=False))
+    return int(tokens)
 
 
 # 공개 별칭 — 다른 모듈(ollama의 동적 num_ctx 산정, E-08)이 같은 추정치를 재사용한다.

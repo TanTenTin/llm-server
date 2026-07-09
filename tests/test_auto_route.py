@@ -14,9 +14,10 @@ auto 라우팅(Phase 2~4) 회귀 테스트.
 
 from app.models import ChatCompletionRequest, Message
 from app.registry import (
-    _CHARS_PER_TOKEN,
+    _ASCII_CHARS_PER_TOKEN,
     _CONTEXT_SAFETY_RATIO,
     _LONG_INPUT_THRESHOLD,
+    _WIDE_CHARS_PER_TOKEN,
     _estimate_tokens,
     route,
 )
@@ -30,8 +31,8 @@ def _req(content: str, **extra) -> ChatCompletionRequest:
 
 
 def _text_of_tokens(tokens: int) -> str:
-    """추정 토큰이 정확히 `tokens`가 되는 더미 텍스트."""
-    return "a" * (tokens * _CHARS_PER_TOKEN)
+    """추정 토큰이 정확히 `tokens`가 되는 더미 ASCII 텍스트."""
+    return "a" * (tokens * _ASCII_CHARS_PER_TOKEN)
 
 
 def test_simple_short_query_prefers_local():
@@ -101,6 +102,26 @@ def test_estimate_includes_tool_calls():
     assert _estimate_tokens(with_calls) - _estimate_tokens(without_calls) >= 10_000
 
 
+def test_korean_input_is_not_underestimated():
+    """
+    한글 입력을 과소추정하면 ollama의 동적 num_ctx가 실제 프롬프트보다 작게 잡히고
+    Ollama가 앞부분을 조용히 잘라낸다. 추정치는 실측 토큰 수 이상이어야 한다.
+
+    실측 기준(ollama/ornith:9b): 아래 한글 산문 6,000자 = prompt_eval_count 3,704토큰.
+    (예전 단일 계수 chars//3 은 2,000토큰으로 봤다 — 1.85배 과소추정.)
+    """
+    measured_tokens = 3_704
+    unit = "오너클랜 회의록. 배송 지연과 재고 정합성 문제를 다룬다. "
+    body = (unit * (6_000 // len(unit) + 1))[:6_000]
+
+    assert _estimate_tokens(_req(body)) >= measured_tokens
+
+
+def test_ascii_estimate_unchanged():
+    """ASCII는 실측(~3.8 chars/token)보다 이미 보수적이라 계수를 유지한다(창 과다할당 방지)."""
+    assert _estimate_tokens(_req("a" * 6_000)) == 6_000 // _ASCII_CHARS_PER_TOKEN
+
+
 def test_reason_exposes_estimated_tokens():
     decision = route(_req("hi"))
     assert ",est=" in decision.reason
@@ -112,7 +133,7 @@ def test_explicit_local_overflow_reorders_to_large_context():
     ollama/qwen3:14b(32k) 명시 + 대용량 입력이면, fallback의 Gemini(1M)를
     앞으로 재정렬하고 reason에 truncate_risk를 실어야 한다(조용한 잘림 방지).
     """
-    big = "가" * (40_000 * _CHARS_PER_TOKEN)  # 추정 ~40k 토큰 (로컬 usable 25.6k 초과)
+    big = "가" * int(40_000 * _WIDE_CHARS_PER_TOKEN)  # 추정 ~40k 토큰 (로컬 usable 25.6k 초과)
     decision = route(ChatCompletionRequest(
         model="ollama/qwen3:14b",
         messages=[{"role": "user", "content": big}],
