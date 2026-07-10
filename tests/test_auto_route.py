@@ -260,19 +260,42 @@ def test_auto_local_candidates_get_saas_fallback():
 
 # ── agentic 티어 (Phase 6) ─────────────────────────────────────
 
-def test_agentic_tier_prefers_large_context():
+def test_agentic_tier_is_local_first():
     """
-    코딩 에이전트 하네스(도구 정의만 수천 토큰)는 입력이 짧아도 1M 창을 먼저 잡는다.
-    로컬 32k로 시작하면 턴이 쌓이며 몇 번 만에 창을 채우고 압축만 반복하게 된다.
+    코딩 에이전트 하네스도 auto의 기본은 로컬이다(비용 0). 입력이 로컬 창에 담기는 동안은
+    로컬이 답하고, Gemini는 폴백으로 뒤에 선다.
     """
     request = _req("안녕", tools=_harness_tools())
     assert _estimate_tokens(request) < _LONG_INPUT_THRESHOLD   # long이 아니라 agentic이어야 함
 
     decision = route(request)
     assert "tier=agentic" in decision.reason
-    assert decision.chain[0].provider == "gemini"              # 1M 창 우선
+    assert [spec.provider for spec in decision.chain] == ["ollama", "gemini"]
+
+
+def test_agentic_promotes_to_large_context_when_local_overflows():
+    """
+    하네스 요청이 로컬 usable 창을 넘으면 컨텍스트 필터가 로컬을 떨어뜨리고 1M Gemini만
+    남는다 — 로컬 우선이어도 대화가 커지면 막히지 않는다.
+
+    입력만으로 로컬 창을 넘기면 _LONG_INPUT_THRESHOLD(25,000)에 먼저 걸려 long 티어가 되므로
+    (로컬 usable 창 26,214가 그보다 크다), agentic에서 승격이 일어나는 실제 경로는
+    '추정 입력 + max_tokens(출력 예산)'이 usable 창을 넘는 경우다.
+    """
+    usable_local = int(_OLLAMA_CONTEXT_WINDOW * _CONTEXT_SAFETY_RATIO)
+    est_target = _LONG_INPUT_THRESHOLD - 3_000            # long 임계값 아래로 유지
+    filler = "a" * (est_target * _ASCII_CHARS_PER_TOKEN)
+    output_budget = usable_local - est_target + 2_000     # 합치면 usable 창 초과
+    request = _req(filler, tools=_harness_tools(), max_tokens=output_budget)
+
+    estimated = _estimate_tokens(request)
+    assert estimated < _LONG_INPUT_THRESHOLD              # long이 아니라 agentic
+    assert estimated + output_budget > usable_local       # 출력까지 합치면 로컬 창 초과
+
+    decision = route(request)
+    assert "tier=agentic" in decision.reason
+    assert [spec.provider for spec in decision.chain] == ["gemini"]   # 로컬은 창 초과로 탈락
     assert decision.chain[0].context_window == 1_000_000
-    assert "ollama" in [spec.provider for spec in decision.chain]  # 로컬은 폴백으로 남음
 
 
 def test_small_tool_use_stays_complex():

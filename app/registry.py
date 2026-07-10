@@ -187,14 +187,17 @@ EMBED_ALIASES: dict[str, str] = {
 #   난이도와 무관하게 1M 컨텍스트 Gemini로 직행한다(로컬 32k는 어차피 필터에서 탈락).
 #
 # Phase 6: 'agentic' 티어. 코딩 에이전트(opencode·Claude Code 등)의 하네스는 도구 정의만으로
-#   수천 토큰을 쓰고, 턴이 쌓이며 파일 내용·도구 결과가 계속 누적된다. 이런 요청을 로컬 32k에
-#   태우면 두세 턴 만에 창을 채우고, 클라이언트는 압축(compaction)만 반복하다 실질 작업 공간을
-#   잃는다. 도구 정의 크기로 하네스를 식별해 1M 창을 '처음부터' 우선한다(로컬은 폴백).
+#   수천 토큰을 쓰고, 턴이 쌓이며 파일 내용·도구 결과가 계속 누적된다. 후보 순서는 다른
+#   티어와 같은 '로컬 우선'이다 — auto의 기본은 비용 0인 로컬이어야 한다.
+#   컨텍스트가 로컬 창을 넘어서는 순간 _auto_route의 _usable_context 필터가 로컬을 떨어뜨려
+#   1M Gemini가 자동으로 잡히므로, 로컬 우선이어도 대화가 커지면 막히지 않는다.
+#   티어를 따로 두는 이유는 후보 순서가 아니라 관측이다 — x-llm-route의 reason=tier=agentic
+#   으로 '이 세션은 하네스라 계속 커질 것'임을 로그에서 구분할 수 있다.
 AUTO_ROUTE = "auto"
 AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
     "simple": ["ollama/qwen3:14b", "gemini-2.5-flash-lite"],
     "complex": ["ollama/qwen3:14b", "gemini-2.5-flash"],
-    "agentic": ["gemini-2.5-flash", "ollama/qwen3:14b"],     # 하네스 = 큰 창 우선, 로컬 폴백
+    "agentic": ["ollama/qwen3:14b", "gemini-2.5-flash"],     # 로컬 우선, 창 넘으면 1M으로 승격
     "long": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],   # 대용량 입력은 로컬 32k 불가 → 클라우드
 }
 
@@ -507,8 +510,8 @@ def _classify_tier(request: ChatCompletionRequest, estimated_tokens: int) -> str
     큰 컨텍스트 모델로 보내는 것 외에 선택지가 없다.
       - long: 추정 입력 토큰 ≥ _LONG_INPUT_THRESHOLD (로컬 usable 창 초과 크기)
       - agentic: 도구 정의만 ≥ _AGENTIC_TOOL_TOKENS (코딩 에이전트 하네스)
-          지금은 입력이 작아도 턴이 쌓이며 반드시 커진다. 로컬 32k로 시작하면 몇 턴 만에
-          창을 채우고 클라이언트가 압축만 반복한다 → 처음부터 1M 창을 우선한다.
+          후보 순서는 complex와 같은 로컬 우선. 입력이 로컬 창을 넘으면 컨텍스트 필터가
+          로컬을 떨어뜨려 1M Gemini로 승격된다. 티어 구분은 관측(reason=tier=agentic)용.
       - complex: 아래 중 하나라도 해당
           · 도구(tools) 사용 (function calling 오케스트레이션은 강한 모델이 유리)
           · 추정 입력 토큰 ≥ _COMPLEX_TOKEN_THRESHOLD (긴 입력)
