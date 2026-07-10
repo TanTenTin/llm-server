@@ -14,6 +14,7 @@ auto 라우팅(Phase 2~4) 회귀 테스트.
 
 from app.models import ChatCompletionRequest, Message
 from app.registry import (
+    _AGENTIC_TOOL_TOKENS,
     _ASCII_CHARS_PER_TOKEN,
     _CONTEXT_SAFETY_RATIO,
     _LONG_INPUT_THRESHOLD,
@@ -23,6 +24,43 @@ from app.registry import (
     context_overflow,
     route,
 )
+
+
+def _harness_tools(count: int = 12) -> list[dict]:
+    """
+    코딩 에이전트 하네스를 흉내내는 도구 정의 묶음(read/edit/bash…).
+    설명·스키마를 충분히 길게 채워 도구 정의만으로 _AGENTIC_TOOL_TOKENS를 넘긴다.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": f"tool_{i}",
+                "description": "Perform a filesystem or shell operation. " * 8,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Absolute path to operate on."},
+                        "content": {"type": "string", "description": "Payload written to the path."},
+                    },
+                    "required": ["path"],
+                },
+            },
+        }
+        for i in range(count)
+    ]
+
+
+def _small_tools() -> list[dict]:
+    """일반 앱의 function calling — 도구 1개, 수백 토큰."""
+    return [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }]
 
 
 def _req(content: str, **extra) -> ChatCompletionRequest:
@@ -179,33 +217,99 @@ def test_explicit_local_small_input_untouched():
 
 
 # ── 모든 로컬 모델에 SaaS 폴백 보장 (_ensure_saas_fallback) ──────
-def test_passthrough_local_gets_saas_fallback():
-    """미등록 패스스루 로컬 모델(ollama/gemma4:12b)도 SaaS(Gemini) 폴백을 받아야 한다."""
+def test_passthrough_local_no_saas_fallback():
+    """
+    명시 라우팅은 폴백하지 않는다 — 미등록 패스스루 로컬 모델도 후보는 자기 자신 하나뿐.
+    로컬이 죽었다고 코드/프롬프트를 Gemini로 내보내지 않는다.
+    """
     decision = route(ChatCompletionRequest(
         model="ollama/gemma4:12b",
         messages=[{"role": "user", "content": "안녕"}],
     ))
-    providers = [spec.provider for spec in decision.chain]
-    assert decision.chain[0].provider == "ollama"      # 로컬 primary 유지
-    assert "gemini" in providers                        # SaaS 폴백 자동 부착
+    assert [spec.provider for spec in decision.chain] == ["ollama"]
 
 
-def test_registry_local_no_duplicate_saas():
-    """이미 gemini 폴백이 있는 로컬 모델엔 중복으로 붙이지 않는다."""
+def test_registry_local_no_saas_fallback():
+    """레지스트리에 등록된 로컬 모델도 마찬가지로 단일 후보."""
     decision = route(ChatCompletionRequest(
         model="ollama/qwen3:14b",
         messages=[{"role": "user", "content": "안녕"}],
     ))
-    gemini_count = sum(1 for spec in decision.chain if spec.provider == "gemini")
-    assert gemini_count == 1
+    assert [spec.provider for spec in decision.chain] == ["ollama"]
 
 
-def test_saas_primary_chain_untouched():
-    """SaaS가 primary면 로컬-only가 아니므로 폴백을 덧붙이지 않는다(기존 체인 유지)."""
+def test_saas_primary_no_local_fallback():
+    """SaaS를 콕 집으면 로컬로 조용히 강등되지 않는다(품질이 다른 모델이 대신 답하면 안 됨)."""
     decision = route(ChatCompletionRequest(
         model="gemini-2.5-flash",
         messages=[{"role": "user", "content": "안녕"}],
     ))
-    assert decision.chain[0].provider == "gemini"
-    # 기존 fallback(ollama/qwen3:14b)만 유지
-    assert [s.provider for s in decision.chain] == ["gemini", "ollama"]
+    assert [spec.provider for spec in decision.chain] == ["gemini"]
+
+
+def test_auto_local_candidates_get_saas_fallback():
+    """반대로 auto(모델 미지정)는 로컬 후보만 남아도 SaaS 폴백을 보장받는다."""
+    decision = route(ChatCompletionRequest(
+        model="auto",
+        messages=[{"role": "user", "content": "안녕"}],
+    ))
+    providers = [spec.provider for spec in decision.chain]
+    assert providers[0] == "ollama"     # simple 티어 → 로컬 우선
+    assert "gemini" in providers        # 클라우드 폴백 부착
+
+
+# ── agentic 티어 (Phase 6) ─────────────────────────────────────
+
+def test_agentic_tier_prefers_large_context():
+    """
+    코딩 에이전트 하네스(도구 정의만 수천 토큰)는 입력이 짧아도 1M 창을 먼저 잡는다.
+    로컬 32k로 시작하면 턴이 쌓이며 몇 번 만에 창을 채우고 압축만 반복하게 된다.
+    """
+    request = _req("안녕", tools=_harness_tools())
+    assert _estimate_tokens(request) < _LONG_INPUT_THRESHOLD   # long이 아니라 agentic이어야 함
+
+    decision = route(request)
+    assert "tier=agentic" in decision.reason
+    assert decision.chain[0].provider == "gemini"              # 1M 창 우선
+    assert decision.chain[0].context_window == 1_000_000
+    assert "ollama" in [spec.provider for spec in decision.chain]  # 로컬은 폴백으로 남음
+
+
+def test_small_tool_use_stays_complex():
+    """도구 1~2개짜리 평범한 function calling은 agentic이 아니라 complex(로컬 우선)."""
+    request = _req("서울 날씨 알려줘", tools=_small_tools())
+    decision = route(request)
+    assert "tier=complex" in decision.reason
+    assert decision.chain[0].provider == "ollama"
+
+
+def test_agentic_threshold_is_tool_definitions_only():
+    """agentic 판정은 '도구 정의' 크기만 본다 — 메시지 길이가 아니라."""
+    from app.registry import _tool_tokens
+    assert _tool_tokens(_req("안녕", tools=_harness_tools())) >= _AGENTIC_TOOL_TOKENS
+    assert _tool_tokens(_req("안녕", tools=_small_tools())) < _AGENTIC_TOOL_TOKENS
+    assert _tool_tokens(_req("안녕")) == 0
+
+
+def test_agentic_local_only_keeps_local_candidate():
+    """
+    local_only면 agentic의 1M 후보(Gemini)가 걷히고 로컬만 남는다. agentic 티어에는
+    로컬 후보가 있으므로 '강등'은 아니다 — local_downgrade는 붙지 않는다.
+    """
+    decision = route(_req("안녕", tools=_harness_tools()), local_only=True)
+    assert [spec.provider for spec in decision.chain] == ["ollama"]
+    assert "local_only=1" in decision.reason
+    assert "local_downgrade=1" not in decision.reason
+
+
+def test_long_local_only_downgrade_is_visible():
+    """
+    long 티어는 후보가 전부 SaaS(1M Gemini)라 local_only면 전멸하고 DEFAULT_MODEL로 강등된다.
+    그 사실이 reason에 남아야 클라이언트가 '1M을 기대했는데 32k를 받았다'를
+    x-llm-route로 진단할 수 있다 — 조용한 강등은 413의 원인이 된다.
+    """
+    huge = "가" * int(_LONG_INPUT_THRESHOLD * _WIDE_CHARS_PER_TOKEN * 1.2)
+    decision = route(_req(huge), local_only=True)
+    assert "tier=long" in decision.reason
+    assert [spec.provider for spec in decision.chain] == ["ollama"]
+    assert "local_downgrade=1" in decision.reason

@@ -17,13 +17,19 @@ class ModelSpec:
     provider: str                              # "ollama" | "anthropic" | "gemini"
     upstream: str                              # provider에 실제로 보낼 모델명
     max_tokens: int | None = None              # 기본 max_tokens (요청에 없을 때 사용)
-    fallback: list[str] = field(default_factory=list)  # 실패 시 시도할 다른 모델 키
+    # 실패 시 시도할 다른 모델 키. **임베딩(EMBEDDING_MODELS) 전용** — chat 모델의 명시
+    # 라우팅은 폴백하지 않으므로(resolve 참고) chat spec에는 비워 둔다.
+    fallback: list[str] = field(default_factory=list)
     # ── 비용/특성 메타 (Phase 1: 로그·헤더 표시용 / Phase 2: 자동선택 판단 근거) ──
     cost_tier: str = "local"                   # "local"(자가호스팅) | "free-cloud"(무료 티어) | "paid"(과금)
     is_free: bool = True                       # 한계비용 0 여부 (무료 티어·로컬=True, 과금 API=False)
     # ── capability 메타 (Phase 2: auto 라우트의 후보 필터 근거) ──
     supports_tools: bool = True                # function calling(도구) 지원 여부
     context_window: int = 32_000               # 최대 입력 컨텍스트(토큰). 보수적 기본값
+    # 모델이 한 번에 낼 수 있는 출력 토큰 상한. /v1/models가 max_output_tokens로 노출해
+    # 클라이언트(opencode 등)가 출력 예산을 잡는 근거로 쓴다. max_tokens(요청 기본값)와는
+    # 다른 개념 — 이쪽은 '모델의 물리 상한', 저쪽은 '요청에 없을 때 쓸 기본값'이다.
+    max_output_tokens: int = 4096
     # 이미지 입력(vision) 지원 여부. 보수적 기본 False — 미지원 모델에 이미지가 가면
     # 조용히 무시되거나 400이 나므로, 확실한 모델만 True로 지정한다(Phase 5).
     supports_vision: bool = False
@@ -57,49 +63,55 @@ _OLLAMA_CAPABILITIES: dict[str, list[str]] = {}
 # ─────────────────────────────────────────────────────────────
 # 레지스트리 (코드 내 관리 — 모델 추가/수정 시 여기만 손대면 됨)
 # ─────────────────────────────────────────────────────────────
+# 주의: chat 모델의 `fallback`은 비워 둔다. 모델을 이름으로 콕 집은 요청은 그 모델로만
+# 시도하고, 실패하면 실패시킨다(조용한 provider 바꿔치기 금지 — 아래 resolve() 참고).
+# provider를 넘나드는 폴백은 model="auto"에서만 일어난다(AUTO_CANDIDATES_BY_TIER).
 MODELS: dict[str, ModelSpec] = {
     # ── Gemini (기본 provider) ───────────────────────────────────
     "gemini-2.5-flash": ModelSpec(
         provider="gemini",
         upstream="gemini-2.5-flash",
-        fallback=["ollama/qwen3:14b"],      # 키 미설정 또는 장애 시 로컬로 폴백
         cost_tier="free-cloud",
         is_free=True,
         supports_tools=True,
         context_window=1_000_000,
+        max_output_tokens=65_536,
         supports_vision=True,
     ),
     "gemini-2.5-flash-lite": ModelSpec(
         provider="gemini",
         upstream="gemini-2.5-flash-lite",
-        fallback=["ollama/qwen3:14b"],
         cost_tier="free-cloud",
         is_free=True,
         supports_tools=True,
         context_window=1_000_000,
+        max_output_tokens=65_536,
         supports_vision=True,
     ),
     # ── Anthropic ───────────────────────────────────────────────
+    # max_output_tokens는 모델의 물리 상한이 아니라 '게이트웨이가 실제로 허용하는 출력'
+    # (= max_tokens 기본값)에 맞춘다. 실제 Claude는 더 큰 출력을 내지만, 여기서 크게
+    # 불러 놓으면 클라이언트가 그만큼 요청했다가 업스트림 400을 맞는다 — 낮춰 잡는 쪽이 안전.
     "claude-sonnet-4-6": ModelSpec(
         provider="anthropic",
         upstream="claude-sonnet-4-6",
         max_tokens=8192,
-        fallback=["ollama/qwen3:14b"],
         cost_tier="paid",
         is_free=False,
         supports_tools=True,
         context_window=200_000,
+        max_output_tokens=8192,
         supports_vision=True,
     ),
     "claude-opus-4-7": ModelSpec(
         provider="anthropic",
         upstream="claude-opus-4-7",
         max_tokens=8192,
-        fallback=["ollama/qwen3:14b"],
         cost_tier="paid",
         is_free=False,
         supports_tools=True,
         context_window=200_000,
+        max_output_tokens=8192,
         supports_vision=True,
     ),
     # ── Ollama (로컬) ────────────────────────────────────────────
@@ -107,7 +119,6 @@ MODELS: dict[str, ModelSpec] = {
     # 추후 'ollama pull qwen3.6:27b' 후 다시 등록하면 fallback/auto 후보로 쓸 수 있다.
     "ollama/qwen3:14b": ModelSpec(
         provider="ollama", upstream="qwen3:14b",
-        fallback=["gemini-2.5-flash"],      # 로컬 장애/과부하 시 Gemini(무료 클라우드)로 폴백
         # (E-02) context_window는 런타임 num_ctx와 한 소스(_OLLAMA_CONTEXT_WINDOW)로 묶는다.
         supports_tools=True, context_window=_OLLAMA_CONTEXT_WINDOW,
     ),
@@ -119,13 +130,15 @@ ALIASES: dict[str, str] = {
     "smart": "gemini-2.5-flash",
 }
 
-# 기본 모델: 로컬 Ollama(qwen3:14b) 우선. 로컬 장애/과부하 시 fallback으로 Gemini(무료 클라우드).
+# 기본 모델: 모델명을 못 알아본 요청이 떨어질 곳. 로컬 Ollama(qwen3:14b).
 DEFAULT_MODEL = "ollama/qwen3:14b"
 
-# 로컬(자가호스팅) 후보만 있는 체인에 자동으로 이어붙일 SaaS 폴백(무료 클라우드 우선).
-# 정책: '어떤 로컬 모델이든' 로컬 장애/과부하 시 클라우드로 넘어갈 곳을 보장한다.
-# 레지스트리에 fallback을 안 적은 로컬 모델이나, 패스스루로 들어온 미등록 ollama/* 모델
-# (예: ollama/gemma4:12b)도 이 보장을 받는다. 과금(Claude)은 넣지 않는다 — 비용 0 유지.
+# auto 라우트의 후보가 전부 로컬일 때 체인 끝에 이어붙일 SaaS 폴백(무료 클라우드).
+# 정책: 'auto로 맡긴 요청'은 로컬 장애/과부하 시 클라우드로 넘어갈 곳을 보장한다.
+# 과금(Claude)은 넣지 않는다 — 비용 0 유지.
+#
+# 명시 라우팅(resolve)에는 붙지 않는다. 사용자가 ollama/qwen3:14b 를 콕 집었으면
+# 그게 죽어도 Gemini로 코드를 내보내지 않는다 — 조용한 provider 바꿔치기 금지.
 LOCAL_SAAS_FALLBACK: list[str] = ["gemini-2.5-flash"]
 
 # ── Realtime(음성) 모델 별칭 ────────────────────────────────
@@ -172,10 +185,16 @@ EMBED_ALIASES: dict[str, str] = {
 #   complex → 로컬 qwen3:14b 우선, 폴백 flash        : 도구 사용·긴 입력·다중턴·추론성 키워드
 # Phase 4: 대용량 컨텍스트 전용 'long' 티어. 추정 입력이 로컬 usable 창을 넘으면
 #   난이도와 무관하게 1M 컨텍스트 Gemini로 직행한다(로컬 32k는 어차피 필터에서 탈락).
+#
+# Phase 6: 'agentic' 티어. 코딩 에이전트(opencode·Claude Code 등)의 하네스는 도구 정의만으로
+#   수천 토큰을 쓰고, 턴이 쌓이며 파일 내용·도구 결과가 계속 누적된다. 이런 요청을 로컬 32k에
+#   태우면 두세 턴 만에 창을 채우고, 클라이언트는 압축(compaction)만 반복하다 실질 작업 공간을
+#   잃는다. 도구 정의 크기로 하네스를 식별해 1M 창을 '처음부터' 우선한다(로컬은 폴백).
 AUTO_ROUTE = "auto"
 AUTO_CANDIDATES_BY_TIER: dict[str, list[str]] = {
     "simple": ["ollama/qwen3:14b", "gemini-2.5-flash-lite"],
     "complex": ["ollama/qwen3:14b", "gemini-2.5-flash"],
+    "agentic": ["gemini-2.5-flash", "ollama/qwen3:14b"],     # 하네스 = 큰 창 우선, 로컬 폴백
     "long": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],   # 대용량 입력은 로컬 32k 불가 → 클라우드
 }
 
@@ -210,6 +229,12 @@ _CONTEXT_SAFETY_RATIO = 0.8
 # long 티어 임계값 (Phase 4): 추정 입력 토큰이 이 값 이상이면 난이도와 무관하게 'long'.
 # 로컬(32k)의 usable 창(32,000 × 0.8 = 25,600)을 넘보는 크기 = 대용량 컨텍스트 전용 라우팅.
 _LONG_INPUT_THRESHOLD = 25_000
+
+# agentic 티어 임계값 (Phase 6): 도구 '정의'만으로 이 토큰을 넘으면 코딩 에이전트 하네스로 본다.
+# opencode·Claude Code류는 read/edit/bash/grep… 십수 개의 JSON 스키마를 매 턴 재전송해
+# 도구 정의만 수천 토큰이다. 반면 일반 앱의 function calling은 도구 1~2개(수백 토큰)에 그친다.
+# 이 경계가 '한 번 부르고 끝나는 요청'과 '턴이 쌓이며 컨텍스트가 커지는 요청'을 가른다.
+_AGENTIC_TOOL_TOKENS = 1500
 
 # 난이도 분류 임계값 — 아래 중 하나라도 걸리면 complex로 본다.
 _COMPLEX_TOKEN_THRESHOLD = 1200        # 추정 입력 토큰 (긴 입력 = 복잡)
@@ -327,8 +352,7 @@ def _spec_for(model: str) -> ModelSpec | None:
 def _ensure_saas_fallback(chain: list[ModelSpec]) -> list[ModelSpec]:
     """
     체인이 전부 로컬(provider="ollama")이면 끝에 SaaS 폴백을 이어붙인다.
-    '모든 로컬 모델은 로컬 장애 시 클라우드로 넘어갈 곳이 있어야 한다'는 보장 —
-    레지스트리에 fallback을 안 적은 로컬 모델과 패스스루 ollama/* 모두 커버한다.
+    **auto 라우트 전용** — 모델 선택을 게이트웨이에 맡긴 요청만 이 보장을 받는다.
     이미 SaaS(비-ollama) 후보가 있으면 손대지 않는다(중복/불필요 방지).
     """
     if any(spec.provider != "ollama" for spec in chain):
@@ -360,26 +384,27 @@ def _local_only_chain(chain: list[ModelSpec]) -> list[ModelSpec]:
 
 def resolve(model: str, *, local_only: bool = False) -> RouteDecision:
     """
-    모델 이름 → RouteDecision(primary + fallback 체인).
+    모델 이름 → RouteDecision. **명시 라우팅은 폴백하지 않는다** — 체인은 후보 하나뿐이다.
       1. 별칭 치환
       2. 레지스트리 조회, 없으면 형태로 추론(패스스루)
       3. 그래도 모르면 DEFAULT_MODEL(로컬 Ollama)
-      4. primary.fallback을 이어붙여 체인 구성
 
-    local_only=True면 4단계 이후 SaaS 후보를 걷어내고 SaaS 폴백도 붙이지 않는다.
+    이름을 콕 집은 요청을 다른 provider로 넘기지 않는 이유: 사용자가 ollama/qwen3:14b를
+    지정했다면 그건 '이 모델로 돌려라'가 아니라 대개 '이 모델로만 돌려라'라는 뜻이다.
+    로컬이 죽었다고 코드·프롬프트를 Gemini로 내보내거나, Gemini가 429라고 품질이 다른
+    로컬 14B가 조용히 답하면 호출자는 무엇이 답했는지 모른 채 결과만 받는다.
+    provider를 넘나드는 폴백이 필요하면 model="auto"로 게이트웨이에 선택을 맡길 것.
+
+    local_only=True인데 SaaS 모델을 지정했다면 DEFAULT_MODEL(로컬)로 강등한다
+    (_local_only_chain — reason/x-llm-route 헤더에 local_only=1로 드러남).
     """
     model = model.strip()                       # 앞뒤 공백으로 인한 오라우팅 방지
     spec = _spec_for(model) or MODELS[DEFAULT_MODEL]
-
     chain = [spec]
-    for fb in spec.fallback:
-        fb_spec = _spec_for(fb)
-        if fb_spec is not None:
-            chain.append(fb_spec)
 
     if local_only:
         return RouteDecision(chain=_local_only_chain(chain), reason="local_only=1")
-    return RouteDecision(chain=_ensure_saas_fallback(chain))
+    return RouteDecision(chain=chain)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -426,6 +451,20 @@ def _estimate_tokens(request: ChatCompletionRequest) -> int:
 estimate_tokens = _estimate_tokens
 
 
+def _tool_tokens(request: ChatCompletionRequest) -> int:
+    """도구 '정의'(스키마)만의 추정 토큰 수. agentic 티어 판정 근거."""
+    if not request.tools:
+        return 0
+    return int(_text_tokens(json.dumps(
+        [tool.model_dump() for tool in request.tools], ensure_ascii=False
+    )))
+
+
+def ollama_context_window() -> int:
+    """로컬 Ollama 모델의 컨텍스트 창(런타임 num_ctx와 한 소스). /v1/models 메타 노출용."""
+    return _OLLAMA_CONTEXT_WINDOW
+
+
 def _usable_context(spec: ModelSpec) -> int:
     """안전 마진(_CONTEXT_SAFETY_RATIO)을 반영한 실효 컨텍스트 크기(토큰)."""
     return int(spec.context_window * _CONTEXT_SAFETY_RATIO)
@@ -462,11 +501,14 @@ def _has_images(request: ChatCompletionRequest) -> bool:
 
 def _classify_tier(request: ChatCompletionRequest, estimated_tokens: int) -> str:
     """
-    요청 티어를 'long' | 'complex' | 'simple'로 분류한다(추가 LLM 호출 없는 휴리스틱).
+    요청 티어를 'long' | 'agentic' | 'complex' | 'simple'로 분류한다(추가 LLM 호출 없는 휴리스틱).
 
     long이 난이도보다 우선한다 — 아무리 단순한 요청이라도 입력이 로컬 창을 넘으면
     큰 컨텍스트 모델로 보내는 것 외에 선택지가 없다.
       - long: 추정 입력 토큰 ≥ _LONG_INPUT_THRESHOLD (로컬 usable 창 초과 크기)
+      - agentic: 도구 정의만 ≥ _AGENTIC_TOOL_TOKENS (코딩 에이전트 하네스)
+          지금은 입력이 작아도 턴이 쌓이며 반드시 커진다. 로컬 32k로 시작하면 몇 턴 만에
+          창을 채우고 클라이언트가 압축만 반복한다 → 처음부터 1M 창을 우선한다.
       - complex: 아래 중 하나라도 해당
           · 도구(tools) 사용 (function calling 오케스트레이션은 강한 모델이 유리)
           · 추정 입력 토큰 ≥ _COMPLEX_TOKEN_THRESHOLD (긴 입력)
@@ -477,6 +519,8 @@ def _classify_tier(request: ChatCompletionRequest, estimated_tokens: int) -> str
     if estimated_tokens >= _LONG_INPUT_THRESHOLD:
         return "long"
     if request.tools:
+        if _tool_tokens(request) >= _AGENTIC_TOOL_TOKENS:
+            return "agentic"
         return "complex"
     if estimated_tokens >= _COMPLEX_TOKEN_THRESHOLD:
         return "complex"
@@ -520,10 +564,15 @@ def _auto_route(request: ChatCompletionRequest, *, local_only: bool = False) -> 
         candidates = [spec for spec in candidates if spec.supports_tools]
     if needs_vision:
         candidates = [spec for spec in candidates if spec.supports_vision]
-    # 로컬 전용 요청은 후보 단계에서 SaaS를 걷어낸다. long 티어처럼 후보가 전부
+    # 로컬 전용 요청은 후보 단계에서 SaaS를 걷어낸다. long/agentic 티어처럼 후보가 전부
     # SaaS인 경우 여기서 전멸하고, 아래 _local_only_chain이 DEFAULT_MODEL로 되돌린다.
+    # 그 강등은 '요청한 티어를 못 지켰다'는 뜻이므로 reason에 명시한다 — 클라이언트가
+    # 1M 창을 기대하고 대화를 안 압축하다 413을 맞는 것을 x-llm-route로 진단할 수 있어야 한다.
+    local_downgrade = False
     if local_only:
-        candidates = [spec for spec in candidates if spec.provider == "ollama"]
+        local_candidates = [spec for spec in candidates if spec.provider == "ollama"]
+        local_downgrade = bool(candidates) and not local_candidates
+        candidates = local_candidates
 
     chain = [spec for spec in candidates if required_tokens <= _usable_context(spec)]
     reason = f"auto:tier={tier},est={estimated_tokens}"
@@ -531,6 +580,8 @@ def _auto_route(request: ChatCompletionRequest, *, local_only: bool = False) -> 
         reason += ",vision=1"
     if local_only:
         reason += ",local_only=1"
+    if local_downgrade:
+        reason += ",local_downgrade=1"
 
     if not chain and candidates:
         # 모든 후보의 창을 넘는 초대형 입력 — 그나마 가장 큰 창으로 best-effort

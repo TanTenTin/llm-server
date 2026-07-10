@@ -46,12 +46,12 @@ class BudgetExceeded(Exception):
 
 class ContextTooLarge(Exception):
     """
-    요청 입력이 후보 모델의 컨텍스트 창을 넘는다 → 413.
+    요청 입력이 후보 모델의 컨텍스트 창을 넘는다 → 체인의 모든 후보가 넘칠 때 413.
 
-    일시 장애가 아니라 '입력 오류'이므로 폴백하지 않고 즉시 실패한다. Ollama는 이 경우
-    에러 없이 창의 절반만 남기고 앞부분을 버려(시스템 프롬프트·도구 정의·초반 대화 소실)
-    조용히 망가진 응답을 내놓는다. 조용한 절단보다 시끄러운 실패가 낫다 —
-    클라이언트가 대화를 압축하거나 창이 큰 모델로 바꿀 기회를 준다.
+    창이 작은 후보는 건너뛰고 더 큰 후보(예: 1M Gemini)를 시도한다. 전원이 넘쳐야 413이다.
+    끝까지 담을 곳이 없으면 조용히 자르지 않고 시끄럽게 실패한다 — Ollama는 이 경우 에러 없이
+    창의 절반만 남기고 앞부분을 버려(시스템 프롬프트·도구 정의·초반 대화 소실) 망가진 응답을
+    내놓기 때문이다. 413을 받은 클라이언트는 대화를 압축하거나 창이 큰 모델로 바꿀 수 있다.
     """
 
 
@@ -237,33 +237,40 @@ def _over_paid_budget(spec: ModelSpec, pool: "ProviderPool") -> bool:
     return pool.usage.paid_tokens_today() >= budget
 
 
-def _reject_if_context_overflow(
+def _context_overflow_error(
     request: ChatCompletionRequest | None,
     spec: ModelSpec,
     label: str,
     pool: "ProviderPool",
     trace: "RouteTrace | None",
-) -> None:
+) -> ContextTooLarge | None:
     """
-    후보에 요청을 보내기 전 컨텍스트 초과를 검사하고, 넘치면 ContextTooLarge를 던진다.
+    후보가 요청을 담을 수 있는지 검사한다. 담으면 None, 넘치면 ContextTooLarge(던지지는 않음).
 
-    폴백하지 않고 즉시 던지는 것이 핵심이다 — 넘치는 입력은 다음 후보에서도 넘치고,
-    Gemini 같은 큰 창으로 조용히 우회하면 사용자가 지정한 모델이 바뀐 걸 모른다.
+    호출 측(fallback 루프)은 이 예외를 `last_exc`에 담고 **다음 후보로 넘어간다**. 예전엔
+    여기서 곧장 raise 했는데, 그러면 체인이 이종(로컬 32k + Gemini 1M)일 때 담을 수 있는
+    후보가 뒤에 있어도 첫 후보의 작은 창 때문에 413이 나갔다 — "넘치는 입력은 다음 후보에서도
+    넘친다"는 전제는 창 크기가 같은 체인에서만 참이다.
+
+    조용한 바꿔치기 우려는 남지 않는다. 실제로 응답한 후보는 `x-llm-route` 헤더(served=)에
+    드러나고, 건너뛴 후보는 trace에 `#context`로 남는다. 모든 후보가 넘치면 루프 끝의
+    `raise last_exc`가 이 예외를 그대로 올려 413이 된다.
+
     request가 없으면(네이티브 패스스루 경로) 검사를 건너뛴다.
     """
     if request is None:
-        return
+        return None
     overflow = context_overflow(request, spec)
     if overflow is None:
-        return
+        return None
     required, window = overflow
     pool.usage.record_error(label, "context")
     if trace is not None:
         trace.attempts.append(f"{label}#context")
     logger.warning(
-        "[route] %s 컨텍스트 초과 → 413 (필요 ~%d토큰 > 창 %d토큰)", label, required, window
+        "[route] %s 컨텍스트 초과 → 건너뜀 (필요 ~%d토큰 > 창 %d토큰)", label, required, window
     )
-    raise ContextTooLarge(
+    return ContextTooLarge(
         f"입력이 {label}의 컨텍스트 창을 초과합니다 "
         f"(필요 ~{required:,}토큰 > 창 {window:,}토큰). "
         f"대화를 압축하거나, 창이 더 큰 모델을 지정하거나, OLLAMA_NUM_CTX를 올리세요."
@@ -410,7 +417,8 @@ async def run_chat_fallback(
     비스트리밍 fallback 공통 루프. 각 후보 spec마다 `invoke(spec)`을 호출해 결과(이미 응답
     포맷으로 완성된 dict)를 받는다. provider 선택·결과 변환의 구체 방식은 invoke에 위임한다.
     미설정 provider(`ProviderUnavailable`)/재시도 가능 에러면 다음 후보로 넘어간다.
-    `request`를 주면 후보마다 컨텍스트 초과를 먼저 검사해 ContextTooLarge(413)로 즉시 실패한다.
+    `request`를 주면 후보마다 컨텍스트 초과를 검사해 담지 못하는 후보는 건너뛴다
+    (전원이 넘치면 ContextTooLarge → 413).
     """
     breaker = pool.breaker
     ordered, deferred = _order_by_breaker(decision.chain, breaker)
@@ -431,7 +439,10 @@ async def run_chat_fallback(
                 trace.attempts.append(f"{label}#budget")
             logger.warning("[route] %s 과금 예산 소진 → 건너뜀", label)
             continue
-        _reject_if_context_overflow(request, spec, label, pool, trace)  # 초과면 즉시 413
+        overflow = _context_overflow_error(request, spec, label, pool, trace)
+        if overflow is not None:
+            last_exc = overflow      # 창이 더 큰 후보가 뒤에 있을 수 있다 → 건너뛴다
+            continue
         try:
             result = await invoke(spec)
         except ProviderUnavailable as e:
@@ -504,7 +515,10 @@ async def run_stream_fallback(
                 trace.attempts.append(f"{label}#budget")
             logger.warning("[route] %s 과금 예산 소진 → 건너뜀", label)
             continue
-        _reject_if_context_overflow(request, spec, label, pool, trace)  # 초과면 즉시 413
+        overflow = _context_overflow_error(request, spec, label, pool, trace)
+        if overflow is not None:
+            last_exc = overflow      # 창이 더 큰 후보가 뒤에 있을 수 있다 → 건너뛴다
+            continue
         try:
             gen = open_stream(spec)  # pool.get 등에서 ProviderUnavailable 가능
         except ProviderUnavailable as e:

@@ -1,17 +1,19 @@
 """
 로컬 전용 라우팅(x-llm-local-only) 회귀 테스트.
 
-배경: 기본 정책(_ensure_saas_fallback)은 '모든 로컬 체인 끝에 Gemini를 붙인다'이다.
+배경: auto 라우팅(_ensure_saas_fallback)은 '로컬 후보만 남은 체인 끝에 Gemini를 붙인다'이다.
 로컬 모델만 쓰기로 한 호출자(예: 코드가 외부로 나가면 안 되는 에이전트)에게는 이게
-조용한 정책 위반이 된다 — ollama/qwen3:14b를 콕 집어도 로컬이 죽으면 Gemini가 답한다.
+조용한 정책 위반이 된다 — auto에 맡겼는데 로컬이 죽으면 Gemini가 답한다.
 
 핵심 보장:
   - local_only=True면 라우팅 체인에 SaaS(비-ollama) provider가 단 하나도 없다.
   - 명시 라우팅·auto 라우팅·long 티어(후보가 전부 SaaS인 경우) 모두에서 성립한다.
   - SaaS 모델을 콕 집어 요청해도 로컬(DEFAULT_MODEL)로 강등되며, 그 사실이
     reason(local_only=1)에 드러나 조용히 넘어가지 않는다.
-  - local_only=False(기본)의 기존 폴백 동작은 그대로다 — 회귀 방지.
   - 헤더 파서 is_local_only는 "1"/"true"/"yes"/"on"(대소문자·공백 무시)만 참으로 본다.
+
+주의: 명시 라우팅은 애초에 폴백이 없으므로(resolve — 조용한 provider 바꿔치기 금지)
+local_only의 실질 효과는 'auto 체인에서 SaaS 제거'와 'SaaS 지정 시 로컬 강등'이다.
 """
 
 import pytest
@@ -39,10 +41,13 @@ def _providers(decision) -> list[str]:
 
 # ── 명시 라우팅 ────────────────────────────────────────────────
 
-def test_명시_로컬모델_기본은_saas폴백이_붙는다() -> None:
-    """기존 동작 보존 — local_only를 주지 않으면 Gemini 폴백이 그대로 이어진다."""
+def test_명시_로컬모델은_기본도_단일후보다() -> None:
+    """
+    명시 라우팅은 local_only 여부와 무관하게 폴백하지 않는다 — 이름을 콕 집었으면 그 모델뿐.
+    (SaaS 폴백은 model="auto"에서만 붙는다. 아래 test_auto_* 참고.)
+    """
     decision = route(_req("ollama/qwen3:14b"))
-    assert "gemini" in _providers(decision)
+    assert _providers(decision) == ["ollama"]
 
 
 def test_명시_로컬모델_local_only면_saas가_전부_빠진다() -> None:

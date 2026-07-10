@@ -6,7 +6,7 @@
 
 - 에이전트/클라이언트가 provider를 몰라도 되도록 추상화
 - 모델 이름만 바꿔서 Gemini ↔ Ollama ↔ Anthropic 전환
-- 기본은 무료 티어 Gemini(`DEFAULT_MODEL=gemini-2.5-flash`), 장애·키 미설정 시 로컬 Ollama로 자동 폴백
+- `model="auto"`면 게이트웨이가 요청 특성으로 백엔드를 고르고 장애 시 폴백한다. **모델을 이름으로 지정하면 폴백하지 않는다**(조용한 provider 바꿔치기 금지 — 실패는 실패로 노출)
 - Oracle 온프레미스 서버에서 실행하는 것을 전제로 설계
 
 ## 기술 스택
@@ -76,15 +76,18 @@ POST /v1/chat/completions
 | 단계 | 처리 |
 |------|------|
 | 1. 별칭 | `ALIASES`에 있으면 실제 모델 키로 치환 (`fast`→gemini-flash-lite, `smart`→gemini-flash) |
-| 2. 레지스트리 | `MODELS`에 등록돼 있으면 그 `ModelSpec`(+fallback 체인) 사용 |
+| 2. 레지스트리 | `MODELS`에 등록돼 있으면 그 `ModelSpec` 사용 (**단일 후보 — 폴백 없음**) |
 | 3. 패스스루 | 미등록이라도 형태로 추론: `gemini-`/`gemini/` → Gemini, `ollama/` → Ollama, `anthropic/`·`claude-` → Anthropic, 그 외 `:` 포함 → Ollama |
-| 4. 기본값 | 위 어디에도 안 걸리면 `DEFAULT_MODEL`(gemini-2.5-flash, 키 없으면 로컬 폴백) |
+| 4. 기본값 | 위 어디에도 안 걸리면 `DEFAULT_MODEL`(ollama/qwen3:14b) |
+
+> **폴백은 `auto` 전용이다.** `resolve()`가 만드는 명시 라우팅 체인은 후보가 하나뿐이라, 지정한 모델이 죽으면 그대로 실패한다. 이름을 콕 집었다는 건 대개 "이 모델로**만** 돌려라"라는 뜻이고, 로컬이 죽었다고 코드를 Gemini로 내보내거나 Gemini가 429라고 품질이 다른 로컬 14B가 대신 답하면 호출자는 무엇이 답했는지 모른다. provider를 넘나드는 폴백이 필요하면 `model="auto"`로 선택을 맡길 것. `MODELS`의 `fallback` 필드는 이제 **임베딩 전용**이다.
 
 ### auto 라우트 (Phase 2~4 — `_auto_route`)
 
 `model="auto"`면 요청 특성으로 게이트웨이가 직접 모델 선택:
 - **티어 분기(Phase 3~4)**: `_classify_tier(request, estimated_tokens)`가 long/complex/simple 판단 → `AUTO_CANDIDATES_BY_TIER[tier]` 선택. 토큰 추정은 `_auto_route`에서 1회만 수행해 전달.
   - **long이 난이도보다 우선(Phase 4)**: `_estimate_tokens` ≥ `_LONG_INPUT_THRESHOLD(25_000)` → long. 후보 [gemini-2.5-flash, gemini-2.5-flash-lite] (둘 다 1M 컨텍스트, 로컬 32k는 어차피 필터 탈락이라 미포함).
+  - **agentic(Phase 6)**: 도구 '정의'만으로 `_AGENTIC_TOOL_TOKENS(1500)` 이상 → 코딩 에이전트 하네스(opencode·Claude Code류)로 보고 후보 [gemini-2.5-flash, ollama/qwen3:14b] — **1M 창을 먼저** 잡는다. 지금 입력이 짧아도 턴이 쌓이며 반드시 커지므로, 로컬 32k로 시작하면 몇 턴 만에 창을 채우고 클라이언트가 압축만 반복한다. 도구 1~2개짜리 평범한 function calling(수백 토큰)은 여전히 complex.
   - complex 조건(하나라도): `tools` 사용 / 추정 토큰 ≥ `_COMPLEX_TOKEN_THRESHOLD(1200)` / 메시지 수 ≥ `_COMPLEX_MESSAGE_COUNT(6)` / 사용자 메시지에 `_COMPLEX_KEYWORDS` 포함.
   - simple → [gemini-2.5-flash-lite, ollama/qwen3:14b] / complex → [gemini-2.5-flash, ollama/qwen3:14b]. 모든 티어 무료만, **과금(Claude) 미포함**(비용 0 보장).
 - **capability 필터(Phase 2·4·5)**: `tools` 있는데 `supports_tools=False`면 제외. 이미지(`image_url` 파트, `_has_images`) 있는데 `supports_vision=False`면 제외(reason에 `,vision=1`) — 네이티브 어댑터가 Anthropic `image`/Gemini `inlineData`를 이미 `image_url`로 변환하므로 OpenAI 포맷만 보면 됨. 컨텍스트는 `추정 입력 + request.max_tokens(출력 예산)` > `_usable_context(spec)`(= `context_window` × `_CONTEXT_SAFETY_RATIO(0.8)`)이면 제외 — 추정 오차 + 로컬의 입력·출력 공유 창을 흡수하는 안전 마진.
@@ -103,7 +106,7 @@ POST /v1/chat/completions
 - **CircuitBreaker (Phase 1 + 동적 쿨다운)**: provider별 일시 장애(429/5xx/연결오류)를 기억해 쿨다운 동안 그 provider를 폴백 체인 **뒤로 미룬다**(`_order_by_breaker`). 무료 티어 Gemini가 429로 막히면 잠깐 Ollama를 우선시켜 헛때리는 지연을 제거. 쿨다운 만료 시 자동 복귀(half-open), 성공 시 즉시 닫힘. `ProviderUnavailable`(키 미설정)은 영구 설정 문제라 회로차단 대상이 아님. 단일 프로세스 코루틴 공유 상태(읽기-쓰기 사이 await 없어 락 불필요).
   - **동적 쿨다운**: `record_failure(provider, cooldown_hint)` — fallback 루프가 `retry_after_seconds(exc)`로 업스트림 힌트(표준 `Retry-After` 헤더 → Gemini 429 본문 `RetryInfo.retryDelay` 순)를 파싱해 전달. 힌트가 있으면 기본 `BREAKER_COOLDOWN_SECONDS` 대신 사용(`_MAX_DYNAMIC_COOLDOWN_SECONDS=3600` 클램프 — RPD 소진 같은 장기 대기도 1시간마다 half-open 탐침). 힌트가 기본값보다 짧으면 그대로 신뢰. 쿨다운 0(비활성) 설정은 힌트보다 우선. `status()`로 open 상태 인트로스펙션(/health/providers가 사용).
 - **UsageTracker (usage.py)**: fallback 루프의 성공/실패 지점에서 집계 — 성공 시 `record_success(label, body, fell_back, is_free)`(3종 usage 필드 정규화, 스트리밍은 body=None으로 요청 수만, is_free=False면 paid 토큰 별도 적립), 실패 시 `record_error(label, kind)`(kind는 "429"/"connect"/"unavailable"/"budget" 등). `ProviderPool.usage`에 인스턴스가 살고 `/v1/usage`가 `snapshot()` 노출(+`paid_tokens_by_day`). 무료 티어 쿼터 관측 + 예산 가드의 데이터 기반.
-- **컨텍스트 초과 가드 (`ContextTooLarge` → 413)**: fallback 루프가 후보 시도 전 `_reject_if_context_overflow`로 `registry.context_overflow(request, spec)`(= 추정 입력 + `max_tokens or DEFAULT_OUTPUT_BUDGET` > `spec.context_window`)를 확인 — 넘치면 **폴백하지 않고 즉시 413**(trace `#context`, usage kind `"context"`). 컨텍스트 초과는 일시 장애가 아니라 입력 오류다. 예전엔 `_guard_context`가 1M 창의 Gemini를 앞으로 재정렬했지만, 지정 모델을 말없이 바꿔치기하는 데다 Gemini가 429로 죽으면 로컬로 되돌아와 **조용히 잘렸다**. 이제 `_guard_context`는 `reason=context_overflow=1,est=..,window=..` 표시만 한다.
+- **컨텍스트 초과 가드 (`ContextTooLarge` → 413)**: fallback 루프가 후보 시도 전 `_context_overflow_error`로 `registry.context_overflow(request, spec)`(= 추정 입력 + `max_tokens or DEFAULT_OUTPUT_BUDGET` > `spec.context_window`)를 확인 — 담지 못하는 후보는 **건너뛰고**(trace `#context`, usage kind `"context"`) 창이 더 큰 후보를 시도한다. 체인의 **전 후보가 넘칠 때만 413**. "넘치는 입력은 다음 후보에서도 넘친다"는 전제는 창 크기가 같은 체인에서만 참이라, auto의 이종 체인(로컬 32k + Gemini 1M)에서는 담을 수 있는 후보를 놓치고 413을 냈다. 명시 라우팅은 후보가 하나뿐이므로 이 스킵이 '조용한 바꿔치기'가 되지 않으며, auto에서 건너뛴 후보와 실제 응답자는 `x-llm-route`에 드러난다. 끝내 담을 곳이 없으면 조용히 자르지 않고 413으로 실패한다(Ollama는 초과분을 에러 없이 잘라 시스템 프롬프트·도구 정의를 잃는다). `_guard_context`는 명시 라우팅에 `reason=context_overflow=1,est=..,window=..` 표시만 한다.
 - **과금 예산 가드 (P1)**: fallback 루프가 후보 시도 전 `_over_paid_budget(spec, pool)` 확인 — `PAID_DAILY_TOKEN_BUDGET` > 0이고 `spec.is_free=False`이며 `usage.paid_tokens_today()` ≥ 예산이면 그 후보를 건너뜀(trace `#budget`, usage kind "budget"). 무료 폴백이 없으면 `BudgetExceeded` → 402. 스트리밍은 토큰 미집계라 예산 소모로 안 잡히는 한계 있음.
 - **응답 캐시 (cache.py, P1)**: `/v1/chat/completions` 핸들러에서 fallback 루프 진입 전 조회 — `cache_key_for()`가 비스트리밍+temperature 미지정/0만 키 발급(요청 전체 정렬 JSON sha256). 히트 시 업스트림 무호출, `x-llm-route: served=cache` + `x-llm-cache: hit`, usage에 "cache" 라벨 집계. miss면 성공 응답을 `put`. 네이티브 엔드포인트는 캐시 미적용(패스스루 보존 우선).
 - **레이트리밋 (ratelimit.py, P1)**: `require_auth`/`require_native_auth`가 인증 통과 후 `_enforce_rate_limit` — 키 sha256(앞 16자) 또는 IP 단위 분당 고정 윈도우. 초과 시 429 + `Retry-After`(다음 분까지 남은 초). WS는 지속 연결이라 미적용.
@@ -162,7 +165,8 @@ OpenAI와 Anthropic의 차이가 있어서 변환 로직이 들어있다. 수정
 - **`/v1/models`는 provider별로 다르게 나열**: SaaS(gemini·anthropic)는 레지스트리(`MODELS`/`EMBEDDING_MODELS`)에서 **정적** 생성(`provider != "ollama"` 필터), Ollama는 `OllamaProvider.list_models()`(`/api/tags`)로 실제 설치 모델을 **실시간 조회**해 유동 노출한다. id는 `ollama/<태그>` 형태(패스스루라 그대로 호출 가능), 임베딩 여부는 Ollama가 주는 `capabilities`(`["embedding"]`)로 판별(구버전이면 이름 휴리스틱). Ollama 서버 미가용 시 레지스트리의 정적 ollama 항목으로 graceful degrade. 각 항목의 `source`(`registry`|`ollama`)로 출처 구분. **SaaS 모델 추가는 `registry.py`만 손대면 반영**되고, **로컬 모델은 `ollama pull`/`rm`이 재기동 없이 즉시 반영**된다.
 - **`tool_choice`는 OpenAI 패스스루(Gemini·Ollama)로 전달**: `AnthropicProvider`만 `tool_choice`를 변환/전달하지 않음.
 - **패스스루 미지 필드 보존(extra="allow")**: `models.py`의 요청/메시지 모델이 `extra="allow"`라 모델이 모르는 메시지 구조 필드(예: `tool_calls`)도 버리지 않고 업스트림에 전달. 요청 레벨 파라미터는 `openai_payload.build_openai_payload`의 `_FORWARD_PARAMS` 화이트리스트로 전달(미지의 요청 레벨 필드는 무차별 전달하지 않음 — 메시지 보존/요청 파라미터 선별). passthrough 손실은 `tests/test_passthrough.py`가 회귀로 막음.
-- **silent fallback 주의**: 등록된 모델이 404/연결오류거나 키 미설정이면 fallback 체인의 다음 후보(로컬 Ollama 등)로 조용히 떨어질 수 있다. 실제 사용된 모델은 응답 `model` 필드 또는 **`x-llm-route` 헤더**로 확인.
+- **fallback은 `auto`에서만 일어난다**: 모델을 이름으로 지정하면 404/연결오류/키 미설정이어도 다른 provider로 떨어지지 않고 그대로 실패한다. `auto` 요청에서 실제 사용된 모델은 응답 `model` 필드 또는 **`x-llm-route` 헤더**로 확인.
+- **`/v1/models`는 `context_length`·`max_output_tokens`를 함께 노출**: 클라이언트(opencode 등)가 대화 압축 시점을 정하는 근거. 로컬 항목은 `OLLAMA_NUM_CTX`를 그대로 반영하므로 설정을 바꾸면 클라이언트 한계도 따라간다. `auto` 항목은 `x-llm-local-only` 헤더가 오면 로컬 창(32k)을 보고한다 — 1M을 보고했다가 클라이언트가 압축을 미루고 413을 맞는 것을 막는다.
 - **게이트웨이 자체 인증 없음**: 앞단에 인증/레이트리밋 없음. 외부 노출 시 별도 보호 필요.
 
 ### 미구현 / 기존 한계 (라우팅과 별개, 추후 과제)

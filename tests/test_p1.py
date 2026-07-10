@@ -185,13 +185,34 @@ def _oversized(model: str) -> ChatCompletionRequest:
     )
 
 
-def test_context_overflow_raises_413_without_falling_back():
+def test_context_overflow_skips_to_larger_window_candidate():
     """
-    컨텍스트 초과는 일시 장애가 아니라 입력 오류다. 체인에 1M 창의 Gemini가 있어도
-    조용히 그쪽으로 넘기지 않고 즉시 ContextTooLarge(413)로 실패해야 한다.
+    창이 작은 후보는 건너뛰고 담을 수 있는 후보(1M Gemini)가 응답한다.
+    "넘치는 입력은 다음 후보에서도 넘친다"는 전제는 창 크기가 같은 체인에서만 참이다.
+    조용한 바꿔치기는 아니다 — 건너뛴 후보는 trace에 #context로, 응답한 후보는 served에 남는다.
+    (이 체인은 auto 라우팅에서만 만들어진다. 명시 라우팅은 후보가 하나뿐이다.)
     """
     pool = ProviderPool()
     decision = RouteDecision(chain=[MODELS["ollama/qwen3:14b"], MODELS["gemini-2.5-flash"]])
+    trace = RouteTrace(requested="auto")
+
+    async def invoke(spec):
+        assert spec.provider == "gemini"   # 로컬(32k)은 건너뛰어야 함
+        return {"id": "ok", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    result = asyncio.run(
+        run_chat_fallback(decision, pool, trace, invoke, _oversized("auto"))
+    )
+    assert result["id"] == "ok"
+    assert any(a.endswith("#context") for a in trace.attempts)   # 로컬은 초과로 스킵 기록
+    assert trace.served == "gemini:gemini-2.5-flash"
+    assert trace.fell_back is True
+
+
+def test_context_overflow_raises_413_when_no_candidate_fits():
+    """담을 수 있는 후보가 하나도 없으면(명시 라우팅 등) ContextTooLarge(413)."""
+    pool = ProviderPool()
+    decision = RouteDecision(chain=[MODELS["ollama/qwen3:14b"]])
     trace = RouteTrace(requested="ollama/qwen3:14b")
 
     async def invoke(spec):

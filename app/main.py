@@ -23,12 +23,14 @@ from app.models import ChatCompletionRequest, EmbeddingsRequest
 from app.providers.ollama import OllamaProvider
 from app.realtime import RealtimeBridge
 from app.registry import (
+    AUTO_CANDIDATES_BY_TIER,
     AUTO_ROUTE,
     DEFAULT_MODEL,
     EMBEDDING_MODELS,
     MODELS,
     ModelSpec,
     RouteDecision,
+    ollama_context_window,
     resolve_embedding,
     route,
     update_ollama_capabilities,
@@ -302,8 +304,13 @@ async def _ollama_models(pool: ProviderPool) -> list[dict]:
         models = await provider.list_models() if isinstance(provider, OllamaProvider) else []
     except Exception:
         # 서버 미가용 등 — 목록이 비지 않도록 레지스트리의 정적 ollama 항목으로 대체.
+        # chat 모델만 컨텍스트 메타를 싣는다(EMBEDDING_MODELS엔 의미 없는 값).
         return [
-            {"id": name, "object": "model", "provider": "ollama", "source": "registry"}
+            {"id": name, "object": "model", "provider": "ollama", "source": "registry",
+             **({} if name in EMBEDDING_MODELS else {
+                 "context_length": spec.context_window,
+                 "max_output_tokens": spec.max_output_tokens,
+             })}
             for name, spec in {**MODELS, **EMBEDDING_MODELS}.items()
             if spec.provider == "ollama"
         ]
@@ -323,28 +330,61 @@ async def _ollama_models(pool: ProviderPool) -> list[dict]:
         # capabilities 우선, 없으면 이름 기반 추정으로 embedding 모델 표시.
         if "embedding" in capabilities or ("embed" in tag.lower() and not capabilities):
             entry["type"] = "embedding"
+        else:
+            # 로컬 chat 모델의 창은 런타임 num_ctx와 한 소스(registry._OLLAMA_CONTEXT_WINDOW).
+            # 입력·출력이 한 창을 나눠 쓰므로 출력 상한은 보수적으로 잡는다.
+            entry["context_length"] = ollama_context_window()
+            entry["max_output_tokens"] = 4096
         entries.append(entry)
     return entries
 
 
+def _auto_context_length(local_only: bool) -> tuple[int, int]:
+    """
+    'auto' 논리 라우트가 실제로 보장하는 (컨텍스트 창, 출력 상한).
+
+    auto의 후보는 티어별로 다르므로 '가장 큰 창'을 보고한다 — 클라이언트가 대화를
+    얼마나 키워도 되는지 판단하는 상한이기 때문이다. 단 local_only 요청은 SaaS 후보가
+    체인에서 걷혀 로컬 창(32k)이 실제 천장이므로, 1M을 보고하면 클라이언트가 압축을
+    미루다 413을 맞는다. 헤더를 보고 정직한 값을 돌려준다.
+    """
+    names = {n for tier in AUTO_CANDIDATES_BY_TIER.values() for n in tier}
+    specs = [MODELS[n] for n in names]
+    if local_only:
+        specs = [s for s in specs if s.provider == "ollama"] or [MODELS[DEFAULT_MODEL]]
+    best = max(specs, key=lambda s: s.context_window)
+    return best.context_window, best.max_output_tokens
+
+
 @app.get("/v1/models")
-async def list_models(_auth: None = Depends(require_auth)) -> dict:
+async def list_models(
+    _auth: None = Depends(require_auth),
+    x_llm_local_only: Optional[str] = Header(default=None),
+) -> dict:
     """
     지원 모델 목록 반환 (OpenAI 호환).
 
     SaaS provider(gemini·anthropic)는 레지스트리(MODELS/EMBEDDING_MODELS)에서 정적으로
     나열하고, Ollama는 서버에 실제 설치된 모델을 /api/tags로 실시간 조회해 유동적으로
     나열한다. 항목의 `source`("registry" | "ollama")로 출처를 구분할 수 있다.
+
+    각 chat 항목은 `context_length`·`max_output_tokens`를 함께 싣는다. 클라이언트가 대화
+    압축 시점을 정하는 근거이며, 로컬 모델은 OLLAMA_NUM_CTX를 그대로 반영하므로 설정을
+    바꾸면 클라이언트 쪽 한계도 자동으로 따라간다(양쪽 하드코딩으로 인한 어긋남 제거).
     """
     pool: ProviderPool = app.state.pool
+    local_only = is_local_only(x_llm_local_only)
 
     # auto는 실제 모델이 아니라 '요청 특성으로 게이트웨이가 고르는' 논리 라우트.
+    auto_context, auto_output = _auto_context_length(local_only)
     data: list[dict] = [
-        {"id": AUTO_ROUTE, "object": "model", "provider": "(auto)"}
+        {"id": AUTO_ROUTE, "object": "model", "provider": "(auto)",
+         "context_length": auto_context, "max_output_tokens": auto_output}
     ]
     # ── SaaS(정적): ollama 이외 provider만 레지스트리에서 나열 ──
     data += [
-        {"id": name, "object": "model", "provider": spec.provider, "source": "registry"}
+        {"id": name, "object": "model", "provider": spec.provider, "source": "registry",
+         "context_length": spec.context_window, "max_output_tokens": spec.max_output_tokens}
         for name, spec in MODELS.items()
         if spec.provider != "ollama"
     ]
