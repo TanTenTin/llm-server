@@ -335,6 +335,12 @@ async def _ollama_models(pool: ProviderPool) -> list[dict]:
             # 입력·출력이 한 창을 나눠 쓰므로 출력 상한은 보수적으로 잡는다.
             entry["context_length"] = ollama_context_window()
             entry["max_output_tokens"] = 4096
+        # /api/tags가 준 capabilities(["tools","vision","thinking",...])를 그대로 노출한다.
+        # 커스텀 provider 모델은 models.dev 같은 공개 레지스트리에 없어, 클라이언트
+        # (opencode 등)가 도구 지원 여부를 알 길이 없다 — 설정에 tool_call을 손으로
+        # 적는 대신 이 필드로 판단할 수 있게 한다. 구버전 Ollama면 필드 자체를 생략.
+        if capabilities:
+            entry["capabilities"] = capabilities
         entries.append(entry)
     return entries
 
