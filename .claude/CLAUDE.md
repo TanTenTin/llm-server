@@ -166,7 +166,7 @@ OpenAI와 Anthropic의 차이가 있어서 변환 로직이 들어있다. 수정
 - **`tool_choice`는 OpenAI 패스스루(Gemini·Ollama)로 전달**: `AnthropicProvider`만 `tool_choice`를 변환/전달하지 않음.
 - **패스스루 미지 필드 보존(extra="allow")**: `models.py`의 요청/메시지 모델이 `extra="allow"`라 모델이 모르는 메시지 구조 필드(예: `tool_calls`)도 버리지 않고 업스트림에 전달. 요청 레벨 파라미터는 `openai_payload.build_openai_payload`의 `_FORWARD_PARAMS` 화이트리스트로 전달(미지의 요청 레벨 필드는 무차별 전달하지 않음 — 메시지 보존/요청 파라미터 선별). passthrough 손실은 `tests/test_passthrough.py`가 회귀로 막음.
 - **fallback은 `auto`에서만 일어난다**: 모델을 이름으로 지정하면 404/연결오류/키 미설정이어도 다른 provider로 떨어지지 않고 그대로 실패한다. `auto` 요청에서 실제 사용된 모델은 응답 `model` 필드 또는 **`x-llm-route` 헤더**로 확인.
-- **`/v1/models`는 `context_length`·`max_output_tokens`를 함께 노출**: 클라이언트(opencode 등)가 대화 압축 시점을 정하는 근거. 로컬 항목은 `OLLAMA_NUM_CTX`를 그대로 반영하므로 설정을 바꾸면 클라이언트 한계도 따라간다. `auto` 항목은 `x-llm-local-only` 헤더가 오면 로컬 창(32k)을 보고한다 — 1M을 보고했다가 클라이언트가 압축을 미루고 413을 맞는 것을 막는다.
+- **`/v1/models`는 `context_length`·`max_output_tokens`를 함께 노출**: 클라이언트(opencode 등)가 대화 압축 시점을 정하는 근거. 로컬 항목은 `OLLAMA_NUM_CTX`를 그대로 반영하므로 설정을 바꾸면 클라이언트 한계도 따라간다. `auto` 항목은 `x-llm-local-only` 헤더가 오면 로컬 창(32k)을 보고한다 — 1M을 보고했다가 클라이언트가 압축을 미루고 413을 맞는 것을 막는다. Ollama chat 항목은 `/api/tags`의 `capabilities`(`["tools","thinking",...]`)도 그대로 노출한다 — 커스텀 provider 모델은 models.dev에 없어 클라이언트가 도구 지원 여부를 알 수 없으므로, 이 필드가 opencode의 `tool_call` 하드코딩을 대체하는 근거다.
 - **게이트웨이 자체 인증 없음**: 앞단에 인증/레이트리밋 없음. 외부 노출 시 별도 보호 필요.
 
 ### 미구현 / 기존 한계 (라우팅과 별개, 추후 과제)
@@ -198,10 +198,22 @@ uvicorn app.main:app --reload          # 개발 (자동 리로드)
 
 ## 로컬 Ollama 모델
 
-Oracle 서버 (4 OCPU, 24GB RAM) 기준 추천 모델:
+**registry 등록 정책**: ollama 모델은 auto 후보/DEFAULT_MODEL일 때만 `MODELS`에 등록한다
+(현재 qwen3:14b뿐). 나머지 설치 모델은 패스스루로 호출하는 것이 정답 — 정적 entry는
+`/api/tags` capability 캐시(tools·vision 실측, 재기동 없이 갱신)를 가리고, 모델 삭제 시
+레지스트리와 실서버가 어긋난다. `/v1/models` 노출도 실시간 조회라 등록이 필요 없다.
+
+2026-07-10 기준 서버 설치 chat 모델은 6종(qwen3:14b, qwen3.5:9b, qwen2.5-coder:7b,
+ornith:9b, gemma4:12b, gemma4:e4b). 게이트웨이 경유 실측 벤치마크
+(**docs/ollama-bench-2026-07.md**) 결과:
+
+- **에이전트용 1순위 ornith:9b** — 12/12 만점, 최저 지연, 출력이 가장 간결(에이전트 루프에서 컨텍스트 절약)
+- 2순위 qwen3.5:9b(균형), gemma4:e4b는 tok/s 1위지만 출력이 10배 장황해 에이전트에 불리
+- **qwen2.5-coder:7b는 에이전트 비추천** — 도구가 필요한 질문에서 호출하지 않고 말로 답하는 실패 관측
 
 ```bash
+ollama pull ornith:9b           # 에이전트용 1순위 (벤치 1위)
+ollama pull qwen3.5:9b          # 균형형 2순위
 ollama pull qwen3:14b           # 속도/품질 균형 (~9GB)
-ollama pull qwen3.6:27b         # 품질 우선 (~17GB)
 ollama pull nomic-embed-text    # /v1/embeddings 로컬 폴백용 (~275MB)
 ```

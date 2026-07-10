@@ -115,8 +115,11 @@ MODELS: dict[str, ModelSpec] = {
         supports_vision=True,
     ),
     # ── Ollama (로컬) ────────────────────────────────────────────
-    # 서버에 실제 pull된 모델만 등록한다. qwen3.6:27b는 미설치(404)라 제거함.
-    # 추후 'ollama pull qwen3.6:27b' 후 다시 등록하면 fallback/auto 후보로 쓸 수 있다.
+    # **ollama 모델은 auto 후보/DEFAULT_MODEL일 때만 등록한다.** 그 외 설치 모델은
+    # 등록 없이 패스스루(_ollama_spec)로 호출하는 쪽이 정답이다 — _spec_for가 MODELS를
+    # 먼저 보므로 정적 entry는 /api/tags capability 캐시(tools·vision 실측, pull/rm 시
+    # 재기동 없이 갱신)를 가려버리고, 모델 삭제 시 레지스트리와 실서버가 어긋난다
+    # (과거 qwen3.6:27b 미설치 404 사례). /v1/models 노출도 실시간 조회라 등록이 필요 없다.
     "ollama/qwen3:14b": ModelSpec(
         provider="ollama", upstream="qwen3:14b",
         # (E-02) context_window는 런타임 num_ctx와 한 소스(_OLLAMA_CONTEXT_WINDOW)로 묶는다.
