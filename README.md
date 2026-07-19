@@ -74,9 +74,11 @@ EOF
 # Ollama 설치 (Linux/ARM 포함)
 curl -fsSL https://ollama.ai/install.sh | sh
 
-# 모델 다운로드
+# 모델 다운로드 (2026-07 벤치마크 결과는 docs/ollama-bench-2026-07.md 참고)
+ollama pull ornith:9b       # 에이전트용 1순위 (12/12 만점, 최저 지연·최고 간결성)
+ollama pull qwen3.5:9b      # 균형형 2순위 (12/12 만점, 콜드 로드 빠름)
 ollama pull qwen3:14b       # 무난한 선택 (~9GB)
-ollama pull qwen3.6:27b     # 품질 우선 (~17GB, Oracle 24GB RAM 서버 권장)
+ollama pull nomic-embed-text  # /v1/embeddings 로컬 폴백용 (~275MB)
 ```
 
 ### 4. 서버 실행
@@ -289,6 +291,7 @@ GET /v1/models
 
 - **SaaS(gemini·anthropic)** — `app/registry.py`의 `MODELS`·`EMBEDDING_MODELS` 레지스트리에서 **정적**으로 나열한다. 모델 추가는 레지스트리만 수정하면 이 목록에 반영된다.
 - **Ollama(로컬)** — 서버의 `/api/tags`로 **실제 설치된 모델을 실시간 조회**한다(유동). `ollama pull`/`ollama rm`으로 로컬 모델이 바뀌면 **재기동 없이 즉시** 목록에 반영된다. id는 `ollama/<태그>` 형태라 그대로 `model` 파라미터로 호출할 수 있고, 임베딩 모델 여부는 Ollama가 주는 `capabilities`(`["embedding"]`)로 판별한다. Ollama 서버가 응답하지 않으면 레지스트리의 정적 ollama 항목으로 graceful degrade 한다.
+- **Ollama chat 항목은 `capabilities` 필드를 그대로 노출**한다(`["completion","tools","thinking",...]`). 커스텀 provider 모델은 models.dev 같은 공개 레지스트리에 없어 클라이언트(opencode 등)가 도구 지원 여부를 알 수 없는데, 이 필드로 설정 하드코딩 없이 판단할 수 있다. 구버전 Ollama라 capabilities가 없으면 필드 자체가 생략된다.
 
 각 항목의 `source` 필드(`"registry"` | `"ollama"`)로 정적/유동 출처를 구분할 수 있다(OpenAI 호환 클라이언트는 미지 필드를 무시).
 
