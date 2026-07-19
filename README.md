@@ -496,21 +496,19 @@ llm-server/
 
 ## 배포 (Oracle + Docker Compose + CI/CD)
 
-Oracle Always Free ARM (4 OCPU, 24GB RAM)에서 **Docker Compose**로 `llm-server` + `ollama`를
-함께 띄우고, `main` 브랜치 push 시 **GitHub Actions**가 SSH로 자동 배포한다.
-외부 도메인(`llm.tan-kim.com`) 노출은 **Lightsail의 Caddy 게이트웨이**(별도 `caddy-config` 레포)가
-공인 IP로 cross-host 프록시한다.
+Oracle Always Free ARM (4 OCPU, 24GB RAM)에서 **Docker Compose**로 `llm-server`를 띄운다
+(Ollama는 이 호스트가 아닌 **원격 로컬-LLM 서버** — `OLLAMA_BASE_URL`로 접속, `62a97d4`).
+`main` 브랜치 push 시 **GitHub Actions**가 SSH로 자동 배포한다.
+외부 도메인(`llm.tan-kim.com`) 노출은 **같은 호스트의 nginx(+Cloudflare)**가 담당한다 —
+컨테이너는 `127.0.0.1:8000`만 퍼블리시한다(`32e6420`).
 
 ```
-        DNS: llm.tan-kim.com → Lightsail
-                 │
-                 ▼
-   Lightsail Caddy (TLS 종료)
-        reverse_proxy <ORACLE_IP>:8000
-                 │  HTTP (Oracle 방화벽에서 Lightsail IP만 허용)
-                 ▼
+   Cloudflare ──▶ Oracle 호스트 nginx (llm.tan-kim.com)
+                     ├─ location /       →  127.0.0.1:8000  (llm-server)
+                     └─ location /aiobs/ →  127.0.0.1:8081  (ai-observability collector)
+                     ▼
    Oracle ─ docker compose
-        llm-server :8000 ──(llm-internal)──▶ ollama :11434
+        llm-server 127.0.0.1:8000 ──(OLLAMA_BASE_URL)──▶ 원격 로컬-LLM :11434
 ```
 
 ### 1. 최초 1회 — 서버 준비
@@ -528,16 +526,16 @@ EOF
 
 docker compose up -d --build
 
-# 레지스트리가 참조하는 Ollama 모델 pull (ollama_data 볼륨에 영속)
-docker compose exec ollama ollama pull qwen3:14b
-docker compose exec ollama ollama pull qwen3.6:27b
+# Ollama 모델은 원격 로컬-LLM 서버에서 관리한다 (이 compose에 ollama 서비스 없음).
+# 레지스트리가 참조하는 모델은 그 서버에서 pull 해둔다: ollama pull qwen3:14b 등
 ```
 
 ### 2. CI/CD (GitHub Actions)
 
 `main`에 `app/**` · `tests/**` · `Dockerfile` · `docker-compose.yml` · `requirements.txt` 변경을 push하면
 `.github/workflows/deploy.yml`이 **pytest를 먼저 실행하고(테스트 게이트), 통과 시에만**
-rsync(`.env` 제외) → `docker compose up -d --build` 한다. 테스트가 깨지면 운영에 나가지 않는다.
+서버에서 `git pull`(`.env`는 gitignore라 보존) → `docker compose up -d --build` 한다.
+테스트가 깨지면 운영에 나가지 않는다.
 
 필요한 GitHub Secrets:
 
@@ -549,10 +547,9 @@ rsync(`.env` 제외) → `docker compose up -d --build` 한다. 테스트가 깨
 
 ### 3. 네트워크 / 방화벽
 
-- **Oracle 보안 목록(VCN Ingress)**: TCP `8000`을 **Lightsail 공인 IP(`54.180.128.251/32`)에서만** 허용.
-- **인스턴스 방화벽**: Oracle 이미지는 기본 iptables/firewalld가 막혀 있으므로 같은 소스로 `8000` 개방 필요.
-  ```bash
-  sudo iptables -I INPUT -p tcp -s 54.180.128.251 --dport 8000 -j ACCEPT
-  ```
-- **DNS**: `llm.tan-kim.com` A → `54.180.128.251`(Lightsail), **DNS only(회색 구름)** — Caddy의 Let's Encrypt 발급용.
+- **컨테이너는 `127.0.0.1:8000`만 퍼블리시** — 외부에서 직접 접근할 수 없고,
+  같은 호스트의 nginx가 `llm.tan-kim.com`으로 프록시한다. 포트 개방(VCN/iptables)이 필요 없다.
+- **DNS**: `llm.tan-kim.com` → Oracle (Cloudflare 경유). TLS는 Cloudflare/nginx 계층에서 처리한다.
 - **인증**: `GATEWAY_API_KEY`를 설정하면 `/v1/*` 호출에 `Authorization: Bearer <키>`가 필요하다. 공인 노출 시 필수.
+- **같은 호스트의 다른 경로**: `llm.tan-kim.com/aiobs/*`는 ai-observability collector(127.0.0.1:8081)로
+  프록시된다 — 이 게이트웨이와 무관한 별도 서비스다 (ai-observability 레포 `docs/deploy.md` 참조).
