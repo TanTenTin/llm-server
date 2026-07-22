@@ -1,0 +1,13 @@
+# 로컬 Realtime 파이프라인(model=local-live) 전용 의존성 — CPU에서 VAD/STT/TTS를 돌린다.
+#
+# 기본 게이트웨이(requirements.txt)에는 넣지 않는다. 이 스택은 무겁고(torch 등) 모델
+# 다운로드가 필요하므로, 로컬 음성 기능을 쓰는 배포에서만 별도로 설치한다:
+#     pip install -r requirements-realtime.txt
+#
+# 이 의존성이 없어도 게이트웨이는 정상 기동하며, model=local-live 세션이 열릴 때만
+# RealtimeMediaUnavailable 에러 이벤트로 '미설치'를 알리고 닫는다(그 외 경로 무영향).
+
+faster-whisper>=1.0.0     # STT — CTranslate2 백엔드(CPU int8), torch 불필요
+silero-vad>=5.1           # VAD — 발화 경계 감지(torch 사용)
+melotts>=0.1.2            # TTS — 한국어 지원, CPU 실시간 배속
+numpy>=1.24              # 오디오 float32 변환(위 패키지들이 이미 의존하지만 명시)

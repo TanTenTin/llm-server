@@ -74,5 +74,31 @@ class Settings(BaseSettings):
     # 클라이언트가 이미 16000으로 보낸다면 16000으로 두면 리샘플을 건너뛴다.
     realtime_input_sample_rate: int = 24000
 
+    # ── 로컬 Realtime 파이프라인 (provider=local, model=local-live) ────────────
+    # STT/TTS/VAD를 게이트웨이 프로세스 안에서 CPU로 돌린다(로컬 전용 원칙 유지 —
+    # 음성·프롬프트가 클라우드로 나가지 않는다). 무거운 모델 의존성
+    # (faster-whisper·MeloTTS·silero-vad)은 requirements-realtime.txt로 분리하고,
+    # 로컬 Live 세션이 '처음 열릴 때' 지연 로드한다 — 기본 게이트웨이 기동엔 영향이 없다.
+    realtime_local_stt_model: str = "small"        # faster-whisper 크기(tiny/base/small/medium)
+    realtime_local_stt_language: str = "ko"        # 전사 언어 고정(자동감지 오판·언어 튐 방지)
+    # STT 실행 디바이스. "cpu"(기본) 또는 "cuda". cuda는 LLM과 VRAM을 나눠 쓰므로
+    # 음성 LLM을 경량 모델로 내렸을 때만 켤 것. cuda 로드 실패 시 cpu로 자동 폴백한다.
+    realtime_local_stt_device: str = "cpu"
+    realtime_local_tts_language: str = "KR"        # MeloTTS 언어 코드
+    realtime_local_tts_speed: float = 1.0          # 발화 속도(1.0=기본)
+    realtime_local_llm_temperature: float = 0.7    # 대화용 샘플링(텍스트 봇과 동일 철학)
+    # 음성 대화에 쓸 LLM 모델. 기본은 게이트웨이 DEFAULT_MODEL과 같은 qwen3:14b —
+    # 텍스트 경로와 모델을 공유해 상주(keep_alive) 모델을 재사용한다(모델 스왑 지연 회피).
+    # 더 빠른 첫 응답이 필요하면 ollama/qwen3.5:9b 등 경량 모델로 바꾼다
+    # (선택지·실측치는 docs/ollama-bench-2026-07.md 참고).
+    realtime_local_llm_model: str = "ollama/qwen3:14b"
+    # 음성 턴 하나의 LLM 출력 상한(토큰). 음성은 2~3문장이면 충분하다 —
+    # 폭주 응답이 TTS 큐를 수십 초씩 붙잡는 것을 막는다. 0 이하면 무제한.
+    realtime_local_llm_max_tokens: int = 200
+    # VAD가 '발화 종료'로 판정할 침묵 길이(ms). 짧으면 말 도중 끊기고, 길면 응답이 늦어진다.
+    realtime_local_vad_silence_ms: int = 700
+    # 클라이언트로 내보낼 출력 PCM16 레이트(Hz). OpenAI Realtime 관례는 24000.
+    realtime_local_output_sample_rate: int = 24000
+
 
 settings = Settings()

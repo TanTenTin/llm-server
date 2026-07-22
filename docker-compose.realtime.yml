@@ -1,0 +1,33 @@
+# 로컬 Realtime(model=local-live) 오버레이 — Ollama와 같은 호스트(예: RTX 3060 박스)에서 실행.
+#
+# 기본 compose(Oracle 게이트웨이용) 위에 얹어, STT/TTS/VAD를 이 호스트에서 돌린다.
+# Oracle 게이트웨이는 손대지 않는다(그쪽은 여전히 gemini-live만 중계).
+#
+#     docker compose -f docker-compose.yml -f docker-compose.realtime.yml up -d --build
+#
+# 이 오버레이가 바꾸는 것:
+#   1) INSTALL_REALTIME=true 로 빌드 → 무거운 스택(torch·MeloTTS·faster-whisper) 설치.
+#   2) OLLAMA_BASE_URL 을 같은 호스트로 덮어 LLM 홉을 localhost 로 만든다(네트워크 왕복 제거).
+#      Ollama 가 호스트에서(컨테이너 밖) 돌므로 host.docker.internal 로 접근한다.
+#   3) 포트를 0.0.0.0 으로 퍼블리시(!override 로 기본의 127.0.0.1 바인딩을 교체) →
+#      봇(Oracle)이 Tailscale 로 이 호스트의 /v1/realtime 에 붙을 수 있게 한다.
+#      ⚠️ tailnet 에 노출되므로 .env 의 GATEWAY_API_KEY 를 반드시 설정할 것(WS 인증).
+#
+# 전제:
+#   - 이 호스트에 Docker(및 Linux면 host-gateway 지원)가 있고 Ollama 가 :11434 로 떠 있다.
+#   - Docker 없이 bare-metal 로 돌리려면 대신:
+#       pip install -r requirements.txt -r requirements-realtime.txt
+#       OLLAMA_BASE_URL=http://localhost:11434 uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+services:
+  llm-server:
+    build:
+      context: .
+      args:
+        INSTALL_REALTIME: "true"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports: !override
+      - "0.0.0.0:8000:8000"

@@ -152,6 +152,36 @@ LIVE_ALIASES: dict[str, str] = {
     "gemini-live": "gemini-2.5-flash-native-audio-preview-09-2025",
 }
 
+
+# ── Realtime(음성) 모델 스펙 — provider 분기의 단일 소스 ──────────
+# 텍스트 경로가 model 필드로 로컬/클라우드를 가르듯, 음성도 model로 백엔드를 고른다.
+# 엔드포인트(/v1/realtime)는 하나로 공유하고, 여기 provider가 어느 브리지로 갈지 결정한다.
+#   - provider="gemini": 기존 RealtimeBridge(클라우드 Gemini Live). upstream 사용.
+#   - provider="local" : LocalRealtimeBridge(VAD→STT→Ollama→TTS, 완전 로컬).
+@dataclass(frozen=True)
+class LiveModelSpec:
+    name: str                        # 정규 id("gemini-live" | "local-live")
+    provider: str                    # "gemini" | "local"
+    upstream: str | None = None      # gemini: Live 모델 id(models/ 접두사는 호출부에서 보정)
+    stt_model: str | None = None     # local: faster-whisper 크기
+    llm_model: str | None = None     # local: "ollama/<태그>" — 기존 Ollama 스트림 재사용
+    tts_voice: str | None = None     # local: TTS 보이스/언어 힌트
+
+
+LIVE_MODELS: dict[str, LiveModelSpec] = {
+    "gemini-live": LiveModelSpec(
+        name="gemini-live", provider="gemini",
+        upstream=LIVE_ALIASES["gemini-live"],
+    ),
+    "local-live": LiveModelSpec(
+        name="local-live", provider="local",
+        stt_model=settings.realtime_local_stt_model,
+        # 음성 LLM은 설정으로 교체 가능(기본: DEFAULT_MODEL과 같은 qwen3:14b — 상주 재사용).
+        llm_model=settings.realtime_local_llm_model,
+        tts_voice=settings.realtime_local_tts_language,
+    ),
+}
+
 # ── Embeddings 모델 (Phase 5 — /v1/embeddings) ──────────────
 # chat 모델(MODELS)과 별개의 임베딩 전용 모델군. Anthropic은 임베딩 API가 없어 제외.
 # ollama/nomic-embed-text 는 서버에 `ollama pull nomic-embed-text` 필요(README 배포 절 참고).
@@ -660,6 +690,28 @@ def resolve_live_model(requested: str | None, default: str) -> str:
     if not name:
         name = default
     return name if name.startswith("models/") else f"models/{name}"
+
+
+def resolve_live(requested: str | None, default: str, local_only: bool) -> LiveModelSpec:
+    """
+    Realtime 요청 모델명 → LiveModelSpec(어느 브리지로 갈지 결정).
+
+      1. 등록된 별칭(LIVE_MODELS)이면 그 스펙을 쓴다.
+      2. 미등록 이름은 Gemini 원시 모델 id로 간주한다(기존 호환 — gemini 브리지가 처리).
+      3. local_only 요청이 클라우드 Live를 콕 집으면 '조용히 바꿔치기'하지 않고 거부한다.
+         (명시 라우팅엔 provider 바꿔치기 금지 — 텍스트 경로의 resolve 정책과 동일.
+          프롬프트/음성을 외부로 내보내면 안 되는 호출자를 위한 안전장치.)
+    """
+    name = (requested or default or "").strip()
+    spec = LIVE_MODELS.get(name) or LiveModelSpec(
+        name=name, provider="gemini", upstream=name  # 미등록 → Gemini raw id
+    )
+    if local_only and spec.provider != "local":
+        raise ValueError(
+            f"x-llm-local-only 요청이 클라우드 Live 모델을 지정했습니다: {name!r} "
+            f"(로컬 음성은 model=local-live 를 사용하세요)"
+        )
+    return spec
 
 
 def _guard_context(request: ChatCompletionRequest, decision: RouteDecision) -> RouteDecision:

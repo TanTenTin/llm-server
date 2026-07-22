@@ -4,3 +4,6 @@ httpx>=0.27.0
 anthropic>=0.40.0
 pydantic-settings>=2.0.0
 websockets>=12.0
+
+# 로컬 Realtime 음성(model=local-live)을 쓸 때만 추가 설치: requirements-realtime.txt
+# (faster-whisper·silero-vad·melotts — 무거워서 기본 스택에서 분리한다.)

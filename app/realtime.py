@@ -22,7 +22,7 @@ import base64
 import json
 import logging
 from itertools import count
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import websockets
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -31,6 +31,15 @@ from app.audio import resample_pcm16
 from app.registry import resolve_live_model
 
 logger = logging.getLogger("llm_gateway")
+
+
+class RealtimeBackend(Protocol):
+    """
+    Realtime 백엔드 공통 계약. 어떤 provider(gemini/local)든 이 하나만 만족하면
+    /v1/realtime 디스패처가 동일하게 구동한다. 클라이언트(봇)는 OpenAI Realtime
+    프로토콜만 보므로 내부가 클라우드인지 로컬인지 몰라도 된다.
+    """
+    async def run(self, client_ws: WebSocket) -> None: ...
 
 # Gemini Live 네이티브 WebSocket 엔드포인트 (인증은 ?key= 쿼리 파라미터)
 GEMINI_LIVE_URL = (

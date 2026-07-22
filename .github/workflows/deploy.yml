@@ -9,6 +9,7 @@ on:
       - "app/**"
       - "tests/**"
       - "requirements.txt"
+      - "requirements-realtime.txt"
       - "Dockerfile"
       - "docker-compose.yml"
       - ".github/workflows/deploy.yml"

@@ -21,7 +21,8 @@ from app.adapters import (
 from app.config import settings
 from app.models import ChatCompletionRequest, EmbeddingsRequest
 from app.providers.ollama import OllamaProvider
-from app.realtime import RealtimeBridge
+from app.realtime import RealtimeBackend, RealtimeBridge
+from app.realtime_local import LocalRealtimeBridge
 from app.registry import (
     AUTO_CANDIDATES_BY_TIER,
     AUTO_ROUTE,
@@ -32,6 +33,7 @@ from app.registry import (
     RouteDecision,
     ollama_context_window,
     resolve_embedding,
+    resolve_live,
     route,
     update_ollama_capabilities,
 )
@@ -676,10 +678,13 @@ async def gemini_generate_v1(
 @app.websocket("/v1/realtime")
 async def realtime(websocket: WebSocket) -> None:
     """
-    OpenAI Realtime API 호환 음성 엔드포인트. 내부에서 Gemini Live로 양방향 중계한다.
-    - 모델: `?model=` 쿼리로 지정(미지정 시 settings.realtime_default_model).
-    - 인증: GATEWAY_API_KEY 설정 시 Authorization 헤더 또는 `?api_key=` 필요.
-    텍스트 경로(ProviderPool/fallback)와 독립 — Live는 로컬 대체가 없어 폴백하지 않는다.
+    OpenAI Realtime API 호환 음성 엔드포인트. `?model=`로 백엔드가 갈린다(텍스트 경로가
+    model 필드로 로컬/클라우드를 가르는 것과 동일). 클라이언트는 프로토콜만 보므로 내부가
+    Gemini인지 로컬인지 몰라도 된다.
+      - model=gemini-live(기본) → Gemini Live 중계(클라우드).
+      - model=local-live       → 완전 로컬(VAD→STT→Ollama→TTS).
+    인증: GATEWAY_API_KEY 설정 시 Authorization 헤더 또는 `?api_key=` 필요.
+    `x-llm-local-only: 1` 헤더를 실으면 클라우드 Live 지정을 거부한다(텍스트와 대칭).
     """
     if not ws_authorized(websocket):
         await websocket.close(code=4401)  # 4401: 애플리케이션 정의 Unauthorized
@@ -702,10 +707,35 @@ async def realtime(websocket: WebSocket) -> None:
             await websocket.close(code=4429)  # 4429: 애플리케이션 정의 Too Many Requests
             return
 
-    bridge = RealtimeBridge(
-        api_key=settings.google_ai_api_key,
-        default_model=settings.realtime_default_model,
-        requested_model=websocket.query_params.get("model"),
-        client_input_rate=settings.realtime_input_sample_rate,
-    )
+    # model → 백엔드 결정. local_only인데 클라우드 Live를 콕 집으면 거부(조용한 바꿔치기 금지).
+    local_only = is_local_only(websocket.headers.get("x-llm-local-only"))
+    try:
+        spec = resolve_live(
+            websocket.query_params.get("model"),
+            settings.realtime_default_model,
+            local_only,
+        )
+    except ValueError as e:
+        await websocket.accept()   # send 전에 핸드셰이크를 완료해야 에러 이벤트를 보낼 수 있다
+        await websocket.send_json({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": str(e)},
+        })
+        await websocket.close()
+        return
+
+    bridge: RealtimeBackend
+    if spec.provider == "local":
+        bridge = LocalRealtimeBridge(
+            spec,
+            pool=websocket.app.state.pool,   # Ollama 스트림 재사용
+            client_input_rate=settings.realtime_input_sample_rate,
+        )
+    else:
+        bridge = RealtimeBridge(
+            api_key=settings.google_ai_api_key,
+            default_model=spec.upstream or settings.realtime_default_model,
+            requested_model=None,            # 이미 spec으로 해석 완료
+            client_input_rate=settings.realtime_input_sample_rate,
+        )
     await bridge.run(websocket)
